@@ -42,12 +42,22 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 | `api` | ✅ | direct streaming `/chat/completions` against an OpenAI-compatible endpoint — cleanest TTFT/tok/s/token numbers (ground truth); only backend for the `tools` suite (OpenAI `tools` parameter) |
 | `dsh` | ✅ | `dsh --profile headless --patch <overlay>`, model routed via a per-run overlay (`--dsh-provider`); prints the final assistant message, no usage → tokens estimated (~4 chars/token, `token_source=estimate`) |
 | `codex` | ✅ | `codex exec --json` with `-c` provider overrides pointing at the local endpoint; JSONL events, per-turn `usage` (server-side tokens) |
-| `claude` | ⏳ | `claude -p --output-format stream-json`; needs an **Anthropic-protocol** endpoint (`ANTHROPIC_BASE_URL`) — not directly servable by this host's OpenAI-only vLLM (bridge planned) |
+| `claude` | ✅ | `claude -p --output-format stream-json --verbose` → `ANTHROPIC_BASE_URL` = endpoint minus `/v1`. **No bridge needed: vLLM ≥ 0.23 serves the Anthropic `/v1/messages` protocol natively** (verified non-streaming + streaming SSE incl. `thinking` blocks). Server-side tokens from the `result` event |
 
 CLI backends run the model as a **full agent**: they get a working directory
 (the per-task scratch dir) plus shell/file tools, which is what the `agentic`
-suite exercises. `api`/`dsh`/`codex` were all validated live against
-`qwen3.8` (see *Host facts* below).
+suite exercises. All four backends are validated live against `qwen3.8` (see
+*Host facts* below).
+
+Claude-specific plumbing (non-interactive agentic as root):
+
+- `--dangerously-skip-permissions` is refused for root, so instead each task
+  gets a project-level allowlist (`<scratch>/.claude/settings.json` with
+  `permissions.allow: Bash/Read/Write/Edit`) **and** a pre-accepted trust
+  entry for the scratch path in `~/.claude.json`
+  (`projects["<scratch>"].hasTrustDialogAccepted = true`) — the documented
+  workaround for the untrusted-workspace gate. The trust file is
+  read-modify-written atomically per task.
 
 ## Metrics (see `metrics_legend` in run.json)
 
@@ -103,10 +113,10 @@ needed). Select with `--suites` (comma-separated; default = all).
 - Host `npu-smi` is broken; NPU state is read via
   `docker exec qwen3.8 npu-smi info`.
 - Live validation (all against `qwen3.8`): `api` full 43-task run = 43/43 pass
-  (gen ~88 tok/s, TTFT p50 2.5 s); `dsh` smoke 3/3, coding 1/1 (agent wrote
-  `solution.py` in scratch); `codex` smoke 1/1 + agentic 5/5 (including fixing a
-  failing unit test). `claude` untestable on this host (needs Anthropic
-  protocol; vLLM here is OpenAI-only).
+  (gen ~88 tok/s, TTFT p50 2.5 s); `dsh` 39/40 (one genuine model miss);
+  `codex` agentic 5/5 (including fixing a failing unit test); `claude` smoke
+  3/3 + agentic 5/5 — all CLIs fixed `buggy.py` and created exact-content
+  files. vLLM 0.23.0 serves Anthropic `/v1/messages` natively (no bridge).
 - The DSH file sandbox denies writes to `~/.dsh` and `~/.codex/tmp`; the CLI
   backends therefore need a one-shot `danger-full-access` escalation in this
   harness (on a normal shell they just run).

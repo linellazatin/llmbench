@@ -1325,24 +1325,53 @@ class CodexBackend(CliBackend):
                 outcome.error = "no agent_message received"
 
 
+def _claude_prepare(scratch: str) -> None:
+    """Make a scratch dir usable for non-interactive agentic claude runs:
+    1. project-level allowlist (<scratch>/.claude/settings.json)
+    2. pre-accept the workspace-trust dialog in ~/.claude.json (documented
+       workaround — claude refuses the allowlist in untrusted workspaces, and
+       --dangerously-skip-permissions cannot be used as root)
+    """
+    os.makedirs(os.path.join(scratch, ".claude"), exist_ok=True)
+    with open(os.path.join(scratch, ".claude", "settings.json"), "w") as f:
+        json.dump({"permissions": {"allow": ["Bash", "Read", "Write", "Edit"]}},
+                  f, indent=1)
+    trust = os.path.expanduser("~/.claude.json")
+    data = {}
+    if os.path.isfile(trust):
+        try:
+            with open(trust) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    entry = data.setdefault("projects", {}).setdefault(scratch, {})
+    entry["hasTrustDialogAccepted"] = True
+    tmp = trust + ".llmbench.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, trust)
+
+
 class ClaudeBackend(CliBackend):
-    """claude -p --output-format stream-json (Anthropic-protocol endpoint)."""
+    """claude -p --output-format stream-json (Anthropic-protocol endpoint;
+    vLLM >= 0.23 serves /v1/messages natively, no bridge needed)."""
 
     name = "claude"
 
     def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
         cfg = self.cfg
         self._prompt = t["prompt"]
+        _claude_prepare(scratch)
         root = cfg.endpoint[:-3] if cfg.endpoint.endswith("/v1") else cfg.endpoint
-        cmd = ["claude", "-p", "--output-format", "stream-json",
+        cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
               "--model", cfg.model,
-              "--dangerously-skip-permissions",
               "--no-session-persistence", t["prompt"]]
         if t.get("system"):
             cmd += ["--append-system-prompt", t["system"]]
         env = dict(os.environ)
         env["ANTHROPIC_BASE_URL"] = root
         env["ANTHROPIC_AUTH_TOKEN"] = cfg.api_key
+        env["ANTHROPIC_API_KEY"] = cfg.api_key
         return cmd, env
 
     def parse_line(self, outcome: TaskOutcome, line: str) -> None:
