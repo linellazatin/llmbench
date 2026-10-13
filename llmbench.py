@@ -19,16 +19,20 @@ Single-file tool, Python 3.10+ stdlib only.
 from __future__ import annotations
 
 import argparse
+import ast
 import http.client
 import json
 import math
+import operator
 import os
 import platform
+import random
 import re
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -484,19 +488,30 @@ def _num(x: str) -> Optional[float]:
             return float(a) / float(b)
         return float(x)
     except (ValueError, ZeroDivisionError):
+        # fallback: trailing number, e.g. "7 × 8 = 56" or "the answer: 42."
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", x)
+        if m:
+            try:
+                return float(m.group())
+            except ValueError:
+                return None
         return None
 
 
-def check_exact(response: str, spec: dict) -> dict:
-    got = response.strip()
-    want = spec["value"].strip()
+def check_exact(ctx: dict, spec: dict) -> dict:
+    got = ctx["response"].strip()
+    want = str(spec["value"]).strip()
     ok = got.lower() == want.lower()
     return {"passed": ok, "expected": want, "actual": got[:200]}
 
 
-def check_answer(response: str, spec: dict) -> dict:
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", "", str(s)).lower()
+
+
+def check_answer(ctx: dict, spec: dict) -> dict:
     """ANSWER: contract with optional numeric equivalence."""
-    got = extract_answer(response)
+    got = extract_answer(ctx["response"])
     want = spec.get("value")
     if want is None:
         return {"passed": False, "expected": None, "actual": got[:200],
@@ -507,20 +522,321 @@ def check_answer(response: str, spec: dict) -> dict:
             ok = got.lower() == str(want).lower()
         else:
             ok = math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-9)
+    elif spec.get("compact"):
+        ok = _norm(got) == _norm(str(want))
     else:
         ok = got.lower() == str(want).lower()
     return {"passed": ok, "expected": want, "actual": got[:200]}
 
 
-def check_math(response: str, spec: dict) -> dict:
+def check_math(ctx: dict, spec: dict) -> dict:
     """ANSWER: contract, numeric equivalence only."""
-    return check_answer(response, {**spec, "numeric": True})
+    return check_answer(ctx, {**spec, "numeric": True})
 
 
-VERIFIERS: dict[str, Callable[[str, dict], dict]] = {
+# --- safe arithmetic eval (tool-argument expressions) -----------------------
+
+_AE_BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+              ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+              ast.FloorDiv: operator.floordiv}
+
+
+def safe_eval(expr: str):
+    node = ast.parse(expr, mode="eval").body
+
+    def ev(n: ast.AST):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in _AE_BINOPS:
+            return _AE_BINOPS[type(n.op)](ev(n.left), ev(n.right))
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+            return -ev(n.operand)
+        raise ValueError(f"unsupported in expression: {ast.dump(n)}")
+
+    return ev(node)
+
+
+# --- instruction-following constraints --------------------------------------
+
+SENT_RE = re.compile(r"[.!?]+(?:\s|$)")
+
+
+def _word_re(w: str) -> re.Pattern:
+    return re.compile(r"(?<![\w'])" + re.escape(w) + r"(?![\w'])", re.IGNORECASE)
+
+
+def check_constraints(ctx: dict, spec: dict) -> dict:
+    text = ctx["response"]
+    checks: list[dict] = []
+    for c in spec["checks"]:
+        t = c["type"]
+        if t == "sentences":
+            n = len(SENT_RE.findall(text.strip()))
+            if "count" in c:
+                ok = n == c["count"]
+                label = f"sentences=={c['count']}"
+            elif "max" in c:
+                ok = n <= c["max"]
+                label = f"sentences<={c['max']}"
+            elif "min" in c:
+                ok = n >= c["min"]
+                label = f"sentences>={c['min']}"
+            else:
+                ok, label = False, "sentences: bad spec"
+            checks.append({"check": label, "passed": ok, "actual": n})
+        elif t == "words":
+            n = len(re.findall(r"\S+", text))
+            if "count" in c:
+                ok = n == c["count"]
+            else:
+                ok = c.get("min", 0) <= n <= c.get("max", 10 ** 9)
+            checks.append({"check": f"words:{c}", "passed": ok, "actual": n})
+        elif t == "include_all":
+            missing = [w for w in c["words"] if not _word_re(w).search(text)]
+            checks.append({"check": f"include {c['words']}", "passed": not missing,
+                           "missing": missing})
+        elif t == "exclude_any":
+            present = [w for w in c["words"] if _word_re(w).search(text)]
+            checks.append({"check": f"exclude {c['words']}", "passed": not present,
+                           "present": present})
+        elif t == "no_chars":
+            found = [ch for ch in c["chars"] if ch in text]
+            checks.append({"check": f"no_chars {c['chars']!r}", "passed": not found,
+                           "found": found})
+        elif t == "lines":
+            lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+            ok = len(lines) == c["count"]
+            if "prefix" in c:
+                ok = ok and all(ln.lstrip().startswith(c["prefix"]) for ln in lines)
+            checks.append({"check": f"lines:{c}", "passed": ok,
+                           "actual": len(lines)})
+        elif t == "first_line":
+            lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+            got = lines[0].strip() if lines else ""
+            ok = (got == c["line"]) if not c.get("ci") else (got.lower() == c["line"].lower())
+            checks.append({"check": "first_line", "passed": ok, "actual": got[:120]})
+        elif t == "json":
+            obj, err = _extract_json(text)
+            if obj is None:
+                checks.append({"check": "json_parse", "passed": False, "detail": err})
+            else:
+                bad = []
+                for key, want in c["shape"].items():
+                    if key not in obj:
+                        bad.append(f"missing {key}")
+                        continue
+                    val = obj[key]
+                    wtype = want.get("type") if isinstance(want, dict) else want
+                    wlen = want.get("len") if isinstance(want, dict) else None
+                    type_ok = {"str": str, "int": int, "float": (int, float),
+                               "list": list, "dict": dict, "bool": bool}.get(
+                                   wtype, wtype)
+                    if wtype in ("int", "float") and not isinstance(val, int):
+                        type_ok = False
+                    if type_ok is not False and not isinstance(val, type_ok):
+                        bad.append(f"{key}: wrong type {type(val).__name__}")
+                    elif isinstance(wlen, int) and not (isinstance(val, (list, str, dict))
+                                                        and len(val) == wlen):
+                        bad.append(f"{key}: len != {wlen}")
+                checks.append({"check": "json_shape", "passed": not bad,
+                               "detail": bad or None,
+                               "actual": json.dumps(obj)[:200]})
+        elif t == "case":
+            alpha = [ch for ch in text if ch.isalpha()]
+            if c["mode"] == "upper":
+                ok = bool(alpha) and all(ch.isupper() for ch in alpha)
+            else:
+                ok = not alpha or all(ch.islower() for ch in alpha)
+            checks.append({"check": f"all_{c['mode']}", "passed": ok})
+        else:
+            checks.append({"check": t, "passed": False,
+                           "detail": f"unknown constraint type {t!r}"})
+    passed = all(c["passed"] for c in checks)
+    return {"passed": passed, "checks": checks}
+
+
+def _extract_json(text: str):
+    t = text.strip()
+    try:
+        return json.loads(t), None
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"```(?:json)?\s*\n?(.*?)```", t, re.S)
+    if m:
+        t2 = m.group(1).strip()
+    else:
+        a, b = t.find("{"), t.rfind("}")
+        t2 = t[a:b + 1] if 0 <= a < b else None
+    if t2:
+        try:
+            return json.loads(t2), None
+        except json.JSONDecodeError as e:
+            return None, str(e)
+    return None, "no JSON object found"
+
+
+# --- coding: extract solution, run unittest suite ---------------------------
+
+CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+
+TEST_BOILERPLATE = '''
+if __name__ == "__main__":
+    import json as _json, sys as _sys
+    _runner = unittest.TextTestRunner(verbosity=0)
+    _res = _runner.run(
+        unittest.defaultTestLoader.loadTestsFromModule(_sys.modules[__name__]))
+    _fails = [str(t).split("\\n")[0]
+              for t, _tb in list(_res.failures) + list(_res.errors)]
+    print(_json.dumps({"total": _res.testsRun,
+                       "passed": _res.testsRun - len(_fails),
+                       "failed": _fails}))
+'''
+
+
+def _extract_code(response: str) -> str:
+    m = CODE_BLOCK_RE.search(response)
+    return m.group(1) if m else response
+
+
+def check_code(ctx: dict, spec: dict) -> dict:
+    code = _extract_code(ctx["response"])
+    work = os.path.join(ctx["out_dir"], "code", ctx["task_id"].replace("/", "__"))
+    os.makedirs(work, exist_ok=True)
+    with open(os.path.join(work, "solution.py"), "w") as f:
+        f.write(code)
+    with open(os.path.join(work, "test.py"), "w") as f:
+        f.write(spec["tests"] + TEST_BOILERPLATE)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "test.py"], cwd=work, capture_output=True, text=True,
+            timeout=spec.get("timeout", 60))
+        out, err = proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return {"passed": False, "detail": "test run timed out",
+                "code_dir": work}
+    summary = None
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith('{"total"'):
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+            break
+    if summary is None:
+        return {"passed": False, "detail": "no test summary",
+                "stdout_tail": out[-800:], "stderr_tail": err[-800:],
+                "code_dir": work}
+    return {"passed": summary["passed"] == summary["total"],
+            "tests": summary, "code_dir": work,
+            "stderr_tail": err[-400:]}
+
+
+# --- tool calling -------------------------------------------------------------
+
+def _args_ok(args: dict, subset: dict) -> bool:
+    for k, v in subset.items():
+        if k not in args:
+            return False
+        a = args[k]
+        if isinstance(v, str):
+            if str(a).lower() != str(v).lower():
+                return False
+        elif a != v:
+            return False
+    return True
+
+
+def check_toolcall(ctx: dict, spec: dict) -> dict:
+    calls = ctx.get("tool_calls") or []
+    checks: list[dict] = []
+    if spec.get("no_calls"):
+        checks.append({"check": "no_calls", "passed": not calls,
+                       "actual_calls": len(calls)})
+    for want in spec.get("calls", []):
+        name, subset = want["name"], want.get("args_subset") or {}
+        match = None
+        for c in calls:
+            if c["name"] == name and _args_ok(c["args"], subset):
+                match = c
+                break
+        entry = {"check": f"call:{name}", "passed": match is not None,
+                 "expected": {"name": name, "args_subset": subset},
+                 "actual": match["args"] if match else
+                         [c["args"] for c in calls]}
+        if want.get("args_eval"):
+            # e.g. {"key": "expression", "expect": 5888} — safe-eval an arg
+            key, expect = want["args_eval"]["key"], want["args_eval"]["expect"]
+            ev_ok = False
+            for c in calls:
+                if c["name"] != name or key not in c["args"]:
+                    continue
+                try:
+                    ev_ok = math.isclose(safe_eval(str(c["args"][key])),
+                                         float(expect), rel_tol=1e-9)
+                except Exception:  # noqa: BLE001
+                    ev_ok = False
+            entry["check"] += f"[eval {key}=={expect}]"
+            entry["passed"] = match is not None and ev_ok
+        checks.append(entry)
+    if "max_calls" in spec:
+        checks.append({"check": "max_calls", "passed": len(calls) <= spec["max_calls"],
+                       "actual": len(calls)})
+    if "min_calls" in spec:
+        checks.append({"check": "min_calls", "passed": len(calls) >= spec["min_calls"],
+                       "actual": len(calls)})
+    if "answer" in spec:
+        sub = check_answer(ctx, {"value": spec["answer"],
+                                 "numeric": spec.get("numeric"),
+                                 "compact": spec.get("compact")})
+        checks.append({"check": "answer", "passed": sub["passed"],
+                       "expected": sub["expected"], "actual": sub["actual"]})
+    return {"passed": all(c["passed"] for c in checks), "checks": checks,
+            "calls": [{"name": c["name"], "args": c["args"]} for c in calls]}
+
+
+def check_gridpath(ctx: dict, spec: dict) -> dict:
+    """Verify a move-string (U/D/L/R) is a shortest valid path on the grid."""
+    got = extract_answer(ctx["response"]).upper().replace(" ", "")
+    grid, expect_len = spec["grid"], spec["expect_len"]
+    start = goal = None
+    for r, row in enumerate(grid):
+        for c, ch in enumerate(row):
+            if ch == "S":
+                start = (r, c)
+            if ch == "G":
+                goal = (r, c)
+    if not re.fullmatch(r"[UDLR]+", got):
+        return {"passed": False, "expected": f"{expect_len} moves",
+                "actual": got[:60], "detail": "not a pure U/D/L/R move string"}
+    r, c = start
+    deltas = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+    bad = None
+    for i, mv in enumerate(got):
+        r += deltas[mv][0]
+        c += deltas[mv][1]
+        if not (0 <= r < len(grid) and 0 <= c < len(grid[0])):
+            bad = f"move {i + 1} ({mv}) leaves the grid"
+            break
+        if grid[r][c] == "#":
+            bad = f"move {i + 1} ({mv}) hits a wall"
+            break
+    if bad:
+        return {"passed": False, "expected": f"{expect_len} moves",
+                "actual": got[:60], "detail": bad}
+    return {"passed": (r, c) == goal and len(got) == expect_len,
+            "expected": f"{expect_len} moves ending at G",
+            "actual": f"{got} ({len(got)} moves)"}
+
+
+VERIFIERS: dict[str, Callable[[dict, dict], dict]] = {
     "exact": check_exact,
     "answer": check_answer,
     "math": check_math,
+    "constraints": check_constraints,
+    "code": check_code,
+    "gridpath": check_gridpath,
+    "toolcall": check_toolcall,
 }
 
 
@@ -541,6 +857,7 @@ class ChatResult:
     finish_reason: Optional[str] = None
     content_chunks: int = 0      # ~content tokens (server streams 1 chunk/token)
     reasoning_chunks: int = 0    # ~reasoning tokens
+    tool_calls: list = field(default_factory=list)  # [{id, name, args}]
     error: Optional[str] = None
     raw_last: Optional[dict] = None
 
@@ -591,6 +908,7 @@ class ApiBackend:
                 return res
 
             buf = b""
+            tc_acc: dict[int, dict] = {}
             while True:
                 chunk = resp.read(1024)
                 if not chunk:
@@ -623,6 +941,16 @@ class ApiBackend:
                                 res.ttft_first_content_s = time.monotonic() - t0
                             res.text += c
                             res.content_chunks += 1
+                        for tcall in delta.get("tool_calls") or []:
+                            idx = tcall.get("index", 0)
+                            d = tc_acc.setdefault(idx, {"id": None, "name": "", "args": ""})
+                            if tcall.get("id"):
+                                d["id"] = tcall["id"]
+                            fn = tcall.get("function") or {}
+                            if fn.get("name"):
+                                d["name"] += fn["name"]
+                            if fn.get("arguments") is not None:
+                                d["args"] += fn["arguments"]
                         if choices[0].get("finish_reason"):
                             res.finish_reason = choices[0]["finish_reason"]
                     usage = ev.get("usage")
@@ -633,8 +961,15 @@ class ApiBackend:
                         res.raw_last = usage
                     if payload == "[DONE]":
                         break
+            for idx in sorted(tc_acc):
+                d = tc_acc[idx]
+                try:
+                    args = json.loads(d["args"]) if d["args"].strip() else {}
+                except json.JSONDecodeError:
+                    args = {"_raw": d["args"]}
+                res.tool_calls.append({"id": d["id"], "name": d["name"], "args": args})
         except Exception as e:  # noqa: BLE001
-            if not res.text:
+            if not res.text and not res.tool_calls:
                 res.error = f"{type(e).__name__}: {e}"
         finally:
             conn.close()
@@ -648,7 +983,7 @@ class ApiBackend:
 
 
 # ---------------------------------------------------------------------------
-# benchmark suites (phase 0: smoke; more families arrive in phase 1)
+# benchmark suites — all tasks are original and deterministic (no downloads)
 # ---------------------------------------------------------------------------
 
 def task(id: str, prompt: str, verify: dict, **meta) -> dict:
@@ -656,31 +991,553 @@ def task(id: str, prompt: str, verify: dict, **meta) -> dict:
             "verify": verify, **meta}
 
 
-SMOKE_CONTRACT = (
+CONTRACT = (
     "\n\nShow your work briefly if needed. End your final reply with exactly one "
     "line in the form: ANSWER: <value>"
 )
 
+CODE_CONTRACT = (
+    "\n\nProvide your complete solution as ONE ```python fenced code block "
+    "containing the function(s) (imports allowed)."
+)
+
 SMOKE_TASKS: list[dict] = [
-    task(
-        "smoke/pong",
-        "Reply with the single word: pong",
-        {"type": "exact", "value": "pong"},
-    ),
-    task(
-        "smoke/math-1",
-        "What is 17 * 24?" + SMOKE_CONTRACT,
-        {"type": "math", "value": 408},
-    ),
-    task(
-        "smoke/math-2",
-        "A train leaves at 09:15 and travels for 2 hours and 40 minutes. "
-        "At what time (24h, HH:MM) does it arrive?" + SMOKE_CONTRACT,
-        {"type": "answer", "value": "11:55"},
-    ),
+    task("smoke/pong", "Reply with the single word: pong",
+         {"type": "exact", "value": "pong"}),
+    task("smoke/math-1", "What is 17 * 24?" + CONTRACT,
+         {"type": "math", "value": 408}),
+    task("smoke/math-2",
+         "A train leaves at 09:15 and travels for 2 hours and 40 minutes. "
+         "At what time (24h, HH:MM) does it arrive?" + CONTRACT,
+         {"type": "answer", "value": "11:55"}),
 ]
 
-SUITES: dict[str, list[dict]] = {"smoke": SMOKE_TASKS}
+# --- reasoning ---------------------------------------------------------------
+
+REASONING_TASKS: list[dict] = [
+    task("reasoning/heads-legs",
+         "A farm has only chickens and rabbits. Together they have 35 heads and "
+         "94 legs. How many rabbits are there?" + CONTRACT,
+         {"type": "math", "value": 12}),
+    task("reasoning/markdown-up",
+         "A $40 jacket is first marked up by 25%, and then the sale price is "
+         "discounted by 20%. What is the final price in dollars?" + CONTRACT,
+         {"type": "math", "value": 40}),
+    task("reasoning/knights-knaves",
+         "On an island every inhabitant is either a knight (always tells the "
+         "truth) or a knave (always lies). A says: 'B is a knave.' B says: "
+         "'A and I are of the same type.' Who is the knight?" + CONTRACT,
+         {"type": "answer", "value": "A", "compact": True}),
+    task("reasoning/syllogism",
+         "All bloops are razzles. All razzles are lazzies. Must all bloops "
+         "definitely be lazzies? Answer yes or no." + CONTRACT,
+         {"type": "answer", "value": "yes", "compact": True}),
+    task("reasoning/sequence",
+         "What number comes next in the sequence: 2, 6, 12, 20, 30, ... ?"
+         + CONTRACT,
+         {"type": "math", "value": 42}),
+    task("reasoning/wet-ground",
+         "If it rains, then the ground gets wet. You observe that the ground "
+         "is wet. Does it follow necessarily that it rained? Answer yes or no."
+         + CONTRACT,
+         {"type": "answer", "value": "no", "compact": True}),
+    task("reasoning/pipes",
+         "Pipe A alone fills a tank in 6 hours; pipe B alone fills it in 3 hours. "
+         "With both pipes open, how many hours does it take to fill the empty "
+         "tank?" + CONTRACT,
+         {"type": "math", "value": 2}),
+    task("reasoning/pages",
+         "A book has 300 pages. On day 1 you read a quarter of the book. On "
+         "day 2 you read a third of what remained. How many pages are left?"
+         + CONTRACT,
+         {"type": "math", "value": 150}),
+]
+
+# --- spatial (seeded generators, answers computed in code) --------------------
+
+def _scene(seed: int, n: int = 6):
+    rnd = random.Random(seed)
+    shapes, colors, sizes = ["cube", "sphere", "cylinder"], ["red", "blue", "gray", "green"], ["small", "large"]
+    cells = [(c, r) for c in (1, 2, 3) for r in (1, 2, 3)]
+    objs = [{"col": c, "row": r, "shape": rnd.choice(shapes),
+             "color": rnd.choice(colors), "size": rnd.choice(sizes)}
+            for (c, r) in rnd.sample(cells, n)]
+    desc = (f"On a 3x3 table there are {n} objects. Columns are numbered 1-3 "
+            f"left to right, rows 1-3 front to back.\n"
+            + "".join(f"Object {i}: a {o['size']} {o['color']} {o['shape']} "
+                       f"at column {o['col']}, row {o['row']}.\n"
+                       for i, o in enumerate(objs, 1)))
+    return objs, desc.strip()
+
+
+def _gen_scene_count() -> tuple[str, str, int]:
+    from collections import Counter
+    for seed in range(101, 400):
+        objs, desc = _scene(seed)
+        cnt = Counter((o["color"], o["shape"]) for o in objs)
+        for (color, shape), n in cnt.items():
+            if n >= 2:
+                return desc, f"How many {color} {shape}s are on the table?", n
+    raise RuntimeError("scene gen failed")
+
+
+def _gen_scene_compare() -> tuple[str, str, str]:
+    for seed in range(201, 500):
+        objs, desc = _scene(seed)
+        pairs = [(a, b) for i, a in enumerate(objs) for b in objs[i + 1:]
+                 if a["size"] != b["size"]]
+        if pairs:
+            a, b = pairs[0]
+            return desc, (f"Object A is at column {a['col']}, row {a['row']}. "
+                           f"Object B is at column {b['col']}, row {b['row']}. "
+                           f"Which one is larger, A or B?"), ("A" if a["size"] == "large" else "B")
+    raise RuntimeError("scene gen failed")
+
+
+def _gen_scene_right() -> tuple[str, str, int]:
+    from collections import Counter
+    for seed in range(301, 600):
+        objs, desc = _scene(seed)
+        cnt = Counter((o["color"], o["shape"]) for o in objs)
+        for (color, shape), n in cnt.items():
+            if n == 1:
+                target = next(o for o in objs if o["color"] == color and o["shape"] == shape)
+                n_right = sum(1 for o in objs if o is not target
+                              and o["row"] == target["row"] and o["col"] > target["col"])
+                return desc, (f"How many objects are in the same row as the "
+                               f"{color} {shape} and strictly to its right?"), n_right
+    raise RuntimeError("scene gen failed")
+
+
+def _bfs(grid: list[str]):
+    from collections import deque
+    start = goal = None
+    for r, row in enumerate(grid):
+        for c, ch in enumerate(row):
+            if ch == "S":
+                start = (r, c)
+            if ch == "G":
+                goal = (r, c)
+    came = {start: None}
+    q = deque([start])
+    moves = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+    while q:
+        cur = q.popleft()
+        if cur == goal:
+            break
+        for mv, (dr, dc) in moves.items():
+            nxt = (cur[0] + dr, cur[1] + dc)
+            r, c = nxt
+            if (0 <= r < len(grid) and 0 <= c < len(grid[0])
+                    and grid[r][c] not in "#S" and nxt not in came):
+                came[nxt] = (cur, mv)
+                q.append(nxt)
+    if goal not in came:
+        raise RuntimeError(f"grid unsolvable: {grid}")
+    path: list[str] = []
+    node = goal
+    while came[node] is not None:
+        prev, mv = came[node]
+        path.append(mv)
+        node = prev
+    path.reverse()
+    return len(path), "".join(path)
+
+
+GRID_B = ["S....", ".###.", ".#.#.", ".###.", "....G"]
+_GRID_LEN, _GRID_PATH = _bfs(GRID_B)
+_GRID_TEXT = "\n".join(GRID_B) + (
+    "\n\nS is the start, G is the goal, # are walls, . are free cells. "
+    "You may move one cell up (U), down (D), left (L) or right (R) per move."
+)
+
+
+def _mapwalk_trace():
+    x = y = 0
+    facing = "north"
+    rot = {"north": "east", "east": "south", "south": "west", "west": "north"}
+    def fwd(n):
+        nonlocal x, y
+        x += {"east": n, "west": -n}.get(facing, 0)
+        y += {"north": n, "south": -n}.get(facing, 0)
+    fwd(2)
+    facing = rot[facing]
+    fwd(3)
+    facing = {"north": "south", "south": "north", "east": "west", "west": "east"}[facing]
+    fwd(1)
+    return f"{x},{y},{facing}"
+
+
+MAPWALK_ANSWER = _mapwalk_trace()
+
+_sc_count, _sc_compare, _sc_right = (_gen_scene_count(), _gen_scene_compare(),
+                                      _gen_scene_right())
+
+SPATIAL_TASKS: list[dict] = [
+    task("spatial/scene-count", _sc_count[0] + "\n\n" + _sc_count[1] + CONTRACT,
+         {"type": "math", "value": _sc_count[2]}),
+    task("spatial/scene-compare", _sc_compare[0] + "\n\n" + _sc_compare[1] + CONTRACT,
+         {"type": "answer", "value": _sc_compare[2], "compact": True}),
+    task("spatial/scene-right", _sc_right[0] + "\n\n" + _sc_right[1] + CONTRACT,
+         {"type": "math", "value": _sc_right[2]}),
+    task("spatial/grid-length",
+         _GRID_TEXT + f"\n\nWhat is the minimum number of moves from S to G?"
+         + CONTRACT,
+         {"type": "math", "value": _GRID_LEN}),
+    task("spatial/grid-path",
+         _GRID_TEXT + (
+             "\n\nGive ONE shortest path from S to G as a string of moves "
+             "using U, D, L, R (e.g. DRRU) with no spaces." + CONTRACT),
+         {"type": "gridpath", "grid": GRID_B, "expect_len": _GRID_LEN}),
+    task("spatial/mapwalk",
+         "You start at position (0, 0) facing north. Perform these moves in "
+         "order: move forward 2; turn right; move forward 3; turn around; move "
+         "forward 1. Coordinates: east increases x, north increases y. Give "
+         "your final position and facing as x,y,compass (e.g. 2,3,north)."
+         + CONTRACT,
+         {"type": "answer", "value": MAPWALK_ANSWER, "compact": True}),
+    task("spatial/arrow-rotate",
+         "Rotate each of these directions by 90 degrees clockwise: north, "
+         "west, south. Give the three resulting directions separated by commas "
+         "(e.g. east,north,west)." + CONTRACT,
+         {"type": "answer", "value": "east,north,west", "compact": True}),
+    task("spatial/cube-stack",
+         "A sculpture is built from unit cubes. The bottom layer is a 3x3 "
+         "square grid of cubes with the center cube missing. On top of it, a "
+         "2x2 square layer of cubes sits centered on the bottom layer. How many "
+         "unit cubes are used in total?" + CONTRACT,
+         {"type": "math", "value": 12}),
+]
+
+# --- instruction following ----------------------------------------------------
+
+IFEVAL_TASKS: list[dict] = [
+    task("ifeval/sentences-keyword",
+         "Write a short description of a lighthouse. Use exactly 2 sentences, "
+         "and the word 'battery' must appear in your text.",
+         {"type": "constraints", "checks": [
+             {"type": "sentences", "count": 2},
+             {"type": "include_all", "words": ["battery"]}]}),
+    task("ifeval/five-words",
+         "Name one color of the rainbow. Respond with exactly 5 words, no "
+         "more, no less.",
+         {"type": "constraints", "checks": [
+             {"type": "words", "count": 5}]}),
+    task("ifeval/json-only",
+         "Respond with ONLY a JSON object (no code fences, no extra text) "
+         "describing a fictional pet, with keys: \"name\" (string), \"age\" "
+         "(integer), \"hobbies\" (list of exactly 3 strings).",
+         {"type": "constraints", "checks": [
+             {"type": "json", "shape": {
+                 "name": "str", "age": "int", "hobbies": {"type": "list", "len": 3}}}]}),
+    task("ifeval/include-exclude",
+         "Write one sentence about a project launch. You must include the "
+         "words 'alpha', 'beta' and 'gamma' in that sentence. Do NOT use the "
+         "word 'delta' anywhere.",
+         {"type": "constraints", "checks": [
+             {"type": "include_all", "words": ["alpha", "beta", "gamma"]},
+             {"type": "exclude_any", "words": ["delta"]}]}),
+    task("ifeval/no-commas",
+         "Write a definition of a bridge in at most 3 sentences. Do not use "
+         "any commas in your entire reply.",
+         {"type": "constraints", "checks": [
+             {"type": "sentences", "max": 3},
+             {"type": "no_chars", "chars": ","}]}),
+    task("ifeval/bullet-lines",
+         "List 4 tips for sleeping well. Each tip must be on its own line and "
+         "every line must start with '- ' (a dash and a space).",
+         {"type": "constraints", "checks": [
+             {"type": "lines", "count": 4, "prefix": "- "}]}),
+    task("ifeval/all-caps",
+         "Shout the word 'fire' twice. Write only in uppercase letters (no "
+         "lowercase letters at all), and use at most 4 words.",
+         {"type": "constraints", "checks": [
+             {"type": "case", "mode": "upper"},
+             {"type": "words", "max": 4}]}),
+    task("ifeval/first-line-number",
+         "Write a summary of any movie you know. The very first line must be "
+         "exactly 'SUMMARY:' and your text must contain the number 42.",
+         {"type": "constraints", "checks": [
+             {"type": "first_line", "line": "SUMMARY:"},
+             {"type": "include_all", "words": ["42"]}]}),
+]
+
+# --- coding (unit-test verified) ----------------------------------------------
+
+def _ct(name: str, prompt: str, tests: str) -> dict:
+    return task(f"coding/{name}", prompt + CODE_CONTRACT,
+                {"type": "code", "tests": tests})
+
+
+CODING_TASKS: list[dict] = [
+    _ct("anagram",
+         "Write a Python function is_anagram(a: str, b: str) -> bool that "
+         "returns True when `a` and `b` contain the same letters (anagrams). "
+         "Ignore case and ignore all non-letter characters. Examples: "
+         "is_anagram('listen', 'silent') is True; is_anagram('hello', 'world') "
+         "is False.",
+         """import unittest
+from solution import is_anagram
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertTrue(is_anagram("listen", "silent"))
+    def test_case_and_spaces(self):
+        self.assertTrue(is_anagram("Dormitory", "Dirty Room"))
+    def test_false(self):
+        self.assertFalse(is_anagram("hello", "world"))
+    def test_empty(self):
+        self.assertTrue(is_anagram("", ""))
+    def test_digits_ignored(self):
+        self.assertTrue(is_anagram("a1b2", "ba"))
+"""),
+    _ct("roman",
+         "Write a Python function parse_roman(s: str) -> int that converts a "
+         "Roman numeral string (values 1..3999, uppercase) to an integer. "
+         "Example: parse_roman('MCMXCIV') is 1994.",
+         """import unittest
+from solution import parse_roman
+
+class Test(unittest.TestCase):
+    def test_one(self):
+        self.assertEqual(parse_roman("I"), 1)
+    def test_9(self):
+        self.assertEqual(parse_roman("IX"), 9)
+    def test_40(self):
+        self.assertEqual(parse_roman("XL"), 40)
+    def test_59(self):
+        self.assertEqual(parse_roman("LIX"), 59)
+    def test_1994(self):
+        self.assertEqual(parse_roman("MCMXCIV"), 1994)
+    def test_3999(self):
+        self.assertEqual(parse_roman("MMMCMXCIX"), 3999)
+    def test_444(self):
+        self.assertEqual(parse_roman("CDXLIV"), 444)
+"""),
+    _ct("merge-intervals",
+         "Write a Python function merge_intervals(intervals: list) -> list that "
+         "takes a list of [start, end] intervals (ints) and returns the "
+         "merged, non-overlapping intervals sorted by start. Intervals that "
+         "touch (e.g. [1,4] and [4,5]) merge. Example: "
+         "merge_intervals([[1,3],[2,6],[8,10]]) is [[1,6],[8,10]].",
+         """import unittest
+from solution import merge_intervals
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(merge_intervals([[1, 3], [2, 6], [8, 10]]), [[1, 6], [8, 10]])
+    def test_touching(self):
+        self.assertEqual(merge_intervals([[1, 4], [4, 5]]), [[1, 5]])
+    def test_single(self):
+        self.assertEqual(merge_intervals([[5, 9]]), [[5, 9]])
+    def test_all_merge(self):
+        self.assertEqual(merge_intervals([[1, 5], [2, 3], [4, 9]]), [[1, 9]])
+    def test_none_overlapping(self):
+        self.assertEqual(merge_intervals([[1, 2], [4, 5]]), [[1, 2], [4, 5]])
+"""),
+    _ct("moving-average",
+         "Write a Python function moving_average(nums: list, k: int) -> list "
+         "that returns the moving average of a sliding window of size k over "
+         "the input list of numbers. If len(nums) < k return []. Values may be "
+         "floats. Example: moving_average([1,2,3,4], 2) is [1.5, 2.5, 3.5].",
+         """import unittest
+from solution import moving_average
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(moving_average([1, 2, 3, 4], 2), [1.5, 2.5, 3.5])
+    def test_window3(self):
+        res = moving_average([1, 3, 5, 7, 9], 3)
+        self.assertEqual(len(res), 3)
+        for got, want in zip(res, [3.0, 5.0, 7.0]):
+            self.assertAlmostEqual(got, want)
+    def test_k1(self):
+        self.assertEqual(moving_average([5, 6], 1), [5.0, 6.0])
+    def test_too_short(self):
+        self.assertEqual(moving_average([1, 2], 3), [])
+    def test_k_equals_len(self):
+        self.assertEqual(moving_average([1, 2, 3], 3), [2.0])
+"""),
+    _ct("parentheses",
+         "Write a Python function valid_parentheses(s: str) -> bool that "
+         "returns True if the string of round, square and curly brackets is "
+         "properly balanced and nested. Example: valid_parentheses('([{}])') "
+         "is True; valid_parentheses('([)]') is False. The empty string is "
+         "valid.",
+         """import unittest
+from solution import valid_parentheses
+
+class Test(unittest.TestCase):
+    def test_ok(self):
+        self.assertTrue(valid_parentheses("()"))
+    def test_mixed(self):
+        self.assertTrue(valid_parentheses("({[]})"))
+    def test_wrong_order(self):
+        self.assertFalse(valid_parentheses("([)]"))
+    def test_unbalanced(self):
+        self.assertFalse(valid_parentheses("((("))
+    def test_empty(self):
+        self.assertTrue(valid_parentheses(""))
+    def test_close_first(self):
+        self.assertFalse(valid_parentheses(")"))
+"""),
+    _ct("flatten",
+         "Write a Python function flatten(x: list) -> list that recursively "
+         "flattens arbitrarily nested lists (tuples are not present in the "
+         "input). Example: flatten([1, [2, [3, [4]]], 5]) is [1, 2, 3, 4, 5]. "
+         "Empty nested lists contribute nothing.",
+         """import unittest
+from solution import flatten
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(flatten([1, [2, [3, [4]]], 5]), [1, 2, 3, 4, 5])
+    def test_flat(self):
+        self.assertEqual(flatten([1, 2, 3]), [1, 2, 3])
+    def test_empty_inner(self):
+        self.assertEqual(flatten([[], [1], []]), [1])
+    def test_all_empty(self):
+        self.assertEqual(flatten([]), [])
+    def test_strings(self):
+        self.assertEqual(flatten(["a", ["b", ["c"]]]), ["a", "b", "c"])
+"""),
+    _ct("caesar",
+         "Write a Python function caesar_cipher(text: str, shift: int) -> str "
+         "that shifts every lowercase letter a-z forward by `shift` positions "
+         "(wrapping around), leaving all other characters unchanged. The shift "
+         "may be larger than 26. Non-lowercase letters are never modified. "
+         "Example: caesar_cipher('abc', 1) is 'bcd' and caesar_cipher('xyz', 3) "
+         "is 'abc'.",
+         """import unittest
+from solution import caesar_cipher
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(caesar_cipher("abc", 1), "bcd")
+    def test_wrap(self):
+        self.assertEqual(caesar_cipher("xyz", 3), "abc")
+    def test_large_shift(self):
+        self.assertEqual(caesar_cipher("a", 27), "b")
+    def test_non_lower_untouched(self):
+        self.assertEqual(caesar_cipher("Abc 123!", 1), "Acd 123!")
+    def test_zero(self):
+        self.assertEqual(caesar_cipher("hello", 0), "hello")
+    def test_punctuation_kept(self):
+        self.assertEqual(caesar_cipher("zoo, zoo!", 1), "app, app!")
+"""),
+    _ct("top-k",
+         "Write a Python function top_k_frequent(nums: list, k: int) -> list "
+         "that returns the k most frequent numbers in `nums`, in decreasing "
+         "order of frequency; ties are broken by first appearance in `nums`. "
+         "Example: top_k_frequent([1,1,2,2,3], 2) is [1, 2].",
+         """import unittest
+from solution import top_k_frequent
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(top_k_frequent([1, 1, 2, 2, 3], 2), [1, 2])
+    def test_tie_first_seen(self):
+        self.assertEqual(top_k_frequent([4, 2, 2, 1, 4], 2), [4, 2])
+    def test_all_distinct(self):
+        self.assertEqual(top_k_frequent([7, 8, 9], 2), [7, 8])
+    def test_single(self):
+        self.assertEqual(top_k_frequent([5], 1), [5])
+    def test_k_3(self):
+        self.assertEqual(top_k_frequent([3, 3, 2, 2, 1], 3), [3, 2, 1])
+"""),
+]
+
+# --- tool calling (api backend) -----------------------------------------------
+
+def tool_def(name: str, desc: str, props: dict, required: list) -> dict:
+    return {"type": "function",
+            "function": {"name": name, "description": desc,
+                         "parameters": {"type": "object", "properties": props,
+                                        "required": required}}}
+
+
+T_WEATHER = tool_def("get_weather", "Get the current weather for a city",
+                     {"city": {"type": "string", "description": "city name"}},
+                     ["city"])
+T_CALC = tool_def("calculate", "Evaluate an arithmetic expression",
+                  {"expression": {"type": "string",
+                                   "description": "arithmetic expression, e.g. '128*46'"}},
+                  ["expression"])
+T_SEARCH = tool_def("search_web", "Search the web for information",
+                    {"query": {"type": "string", "description": "search query"}},
+                    ["query"])
+T_EMAIL = tool_def("send_email", "Send an email message",
+                   {"to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"}},
+                   ["to", "subject", "body"])
+T_BOOK = tool_def("create_reservation", "Create a restaurant reservation",
+                  {"name": {"type": "string"},
+                   "date": {"type": "string", "description": "date, YYYY-MM-DD"},
+                   "guests": {"type": "integer"}},
+                  ["name", "date", "guests"])
+T_STOCK = tool_def("get_stock_price", "Get the current price of a stock",
+                   {"symbol": {"type": "string", "description": "ticker symbol"}},
+                   ["symbol"])
+
+TOOL_SYSTEM = ("You have tools available. You MUST use the appropriate tool(s) "
+               "to fulfill the user's request — call the tool(s) with the "
+               "correct arguments instead of answering from memory or with "
+               "plain text.")
+
+TOOLS_TASKS: list[dict] = [
+    task("tools/weather", "What is the weather like in Tokyo?",
+         {"type": "toolcall", "calls": [
+             {"name": "get_weather", "args_subset": {"city": "tokyo"}}]},
+         system=TOOL_SYSTEM, tools=[T_WEATHER]),
+    task("tools/calc-eval", "What is 128 * 46?",
+         {"type": "toolcall", "calls": [
+             {"name": "calculate",
+              "args_eval": {"key": "expression", "expect": 5888}}]},
+         system=TOOL_SYSTEM, tools=[T_CALC]),
+    task("tools/search", "Find out who the first person to walk on the moon was.",
+         {"type": "toolcall", "calls": [{"name": "search_web"}]},
+         system=TOOL_SYSTEM, tools=[T_SEARCH]),
+    task("tools/email", "Email alice@example.com with subject 'Meeting moved' "
+                        "and body 'The meeting is now at 3pm.'.",
+         {"type": "toolcall", "calls": [
+             {"name": "send_email",
+              "args_subset": {"to": "alice@example.com",
+                              "subject": "Meeting moved"}}]},
+         system=TOOL_SYSTEM, tools=[T_EMAIL]),
+    task("tools/booking", "Book a table for 4 under the name 'Bob Stone' on "
+                         "2026-08-14.",
+         {"type": "toolcall", "calls": [
+             {"name": "create_reservation",
+              "args_subset": {"name": "bob stone", "date": "2026-08-14",
+                              "guests": 4}}]},
+         system=TOOL_SYSTEM, tools=[T_BOOK]),
+    task("tools/multi", "What's the weather in Paris, and what is 15 percent of 240?",
+         {"type": "toolcall", "min_calls": 2, "calls": [
+             {"name": "get_weather", "args_subset": {"city": "paris"}},
+             {"name": "calculate", "args_eval": {"key": "expression", "expect": 36}}]},
+         system=TOOL_SYSTEM, tools=[T_WEATHER, T_CALC]),
+    task("tools/no-call-needed",
+         "What is 7 * 8? (You know this one — no lookup needed.)" + CONTRACT,
+         {"type": "toolcall", "no_calls": True, "answer": 56, "numeric": True},
+         system=("You have tools available, but you may also answer directly "
+                 "when no tool is needed."),
+         tools=[T_WEATHER]),
+    task("tools/two-stocks", "Get the current prices of AAPL and MSFT.",
+         {"type": "toolcall", "min_calls": 2, "calls": [
+             {"name": "get_stock_price", "args_subset": {"symbol": "aapl"}},
+             {"name": "get_stock_price", "args_subset": {"symbol": "msft"}}]},
+         system=TOOL_SYSTEM, tools=[T_STOCK]),
+]
+
+SUITES: dict[str, list[dict]] = {
+    "smoke": SMOKE_TASKS,
+    "reasoning": REASONING_TASKS,
+    "spatial": SPATIAL_TASKS,
+    "ifeval": IFEVAL_TASKS,
+    "coding": CODING_TASKS,
+    "tools": TOOLS_TASKS,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -812,7 +1669,11 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     result: ChatResult
     t_start = time.monotonic()
     if cfg.backend == "api":
-        result = backend.chat([{"role": "user", "content": t["prompt"]}])
+        msgs = []
+        if t.get("system"):
+            msgs.append({"role": "system", "content": t["system"]})
+        msgs.append({"role": "user", "content": t["prompt"]})
+        result = backend.chat(msgs, tools=t.get("tools"))
     else:  # pragma: no cover — phase 2
         raise NotImplementedError
     sampler.stop()
@@ -835,6 +1696,7 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
         "total_tokens": result.total_tokens,
         "content_chunks": result.content_chunks,
         "reasoning_chunks": result.reasoning_chunks,
+        "tool_calls": result.tool_calls,
         "error": result.error,
         "decode_tps": None,
         "gen_tps": None,
@@ -858,13 +1720,15 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
         res["overall_tps"] = round(result.completion_tokens / result.total_s, 2)
 
     # verdict
-    if not result.error and result.text:
+    if not result.error and (result.text or result.tool_calls):
         verifier = VERIFIERS.get(t["verify"]["type"])
         if verifier is None:
             res["verdict"] = {"passed": False, "detail":
-                              f"unimplemented verifier '{t['verify']['type']}' (phase 1)"}
+                              f"unknown verifier '{t['verify']['type']}'"}
         else:
-            res["verdict"] = verifier(result.text, t["verify"])
+            ctx = {"response": result.text, "tool_calls": result.tool_calls,
+                   "task_id": rid, "out_dir": out_dir}
+            res["verdict"] = verifier(ctx, t["verify"])
             res["status"] = "pass" if res["verdict"]["passed"] else "fail"
 
     res["resources"] = aggregate_resources(

@@ -34,7 +34,7 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 
 | backend | status | how |
 |---|---|---|
-| `api` | ✅ phase 0 | direct streaming `/chat/completions` against an OpenAI-compatible endpoint — cleanest TTFT/tok/s/token numbers (ground truth) |
+| `api` | ✅ | direct streaming `/chat/completions` against an OpenAI-compatible endpoint — cleanest TTFT/tok/s/token numbers (ground truth); also the only backend for the `tools` suite (OpenAI `tools` parameter) |
 | `dsh` | ⏳ phase 2 | `dsh --profile headless` (already wired to the local vLLM via `~/.dsh/settings.yaml`) |
 | `codex` | ⏳ phase 2 | `codex exec --json` with `-c` provider overrides pointing at the local endpoint |
 | `claude` | ⏳ phase 2+ | `claude -p --output-format stream-json`; needs an Anthropic-protocol endpoint (built-in OpenAI→Anthropic bridge planned) |
@@ -71,10 +71,19 @@ block and in the report's Resources section.
 
 ## Suites
 
-Phase 0 ships the `smoke` suite (3 sanity tasks) to validate the whole
-pipeline. Phase 1 adds the real families — coding, reasoning, spatial,
-instruction-following, tool-calling (~8 tasks each, all original and
-deterministic, no downloads).
+All tasks are original and deterministic (no dataset downloads, no network
+needed). Select with `--suites` (comma-separated; default = all).
+
+| suite | tasks | what's scored | verifier |
+|---|---|---|---|
+| `smoke` | 3 | pipeline sanity | exact / math / answer |
+| `reasoning` | 8 | word problems, knights-&-knaves, syllogisms, sequences, logic fallacies | `ANSWER:` contract + numeric/string equivalence |
+| `spatial` | 8 | seeded CLEVR-style 3D table scenes (count/compare/relational), grid shortest path (length + move string), map directions, rotation, cube counting | math / answer / move-string simulation on the grid |
+| `ifeval` | 8 | programmatically checkable constraints (exact sentence/word counts, keyword include/exclude, JSON-only shape, line prefixes, casing, punctuation bans, first line) | constraint checkers (all must pass) |
+| `coding` | 8 | original unit-tested problems (anagram, roman, intervals, moving avg, parens, flatten, caesar, top-k) | solution extracted from first ` ```python ` block, unittest suite run in a temp dir (60 s timeout) |
+| `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
+
+`python3 selftest.py` runs fast offline verifier self-tests.
 
 ## Notes / host facts (2026-10-13)
 
