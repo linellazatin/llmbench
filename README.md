@@ -15,9 +15,14 @@ Single file, Python 3.10+ stdlib only, zero dependencies.
 # run the smoke suite against the local vLLM endpoint (OpenAI-compatible API)
 python3 llmbench.py run --backend api --endpoint http://127.0.0.1:8000/v1 --model qwen3.8
 
-# browse tasks, re-render a report, or monitor resources standalone
+# run the same suite through an agentic CLI backend instead
+python3 llmbench.py run --backend codex --suites agentic
+python3 llmbench.py run --backend dsh --suites reasoning,spatial
+
+# browse tasks, re-render a report, compare runs, or monitor resources standalone
 python3 llmbench.py list
 python3 llmbench.py report results/<run-id>
+python3 llmbench.py compare results/<run-a> results/<run-b>
 python3 llmbench.py sample --seconds 30
 ```
 
@@ -34,23 +39,26 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 
 | backend | status | how |
 |---|---|---|
-| `api` | ✅ | direct streaming `/chat/completions` against an OpenAI-compatible endpoint — cleanest TTFT/tok/s/token numbers (ground truth); also the only backend for the `tools` suite (OpenAI `tools` parameter) |
-| `dsh` | ⏳ phase 2 | `dsh --profile headless` (already wired to the local vLLM via `~/.dsh/settings.yaml`) |
-| `codex` | ⏳ phase 2 | `codex exec --json` with `-c` provider overrides pointing at the local endpoint |
-| `claude` | ⏳ phase 2+ | `claude -p --output-format stream-json`; needs an Anthropic-protocol endpoint (built-in OpenAI→Anthropic bridge planned) |
+| `api` | ✅ | direct streaming `/chat/completions` against an OpenAI-compatible endpoint — cleanest TTFT/tok/s/token numbers (ground truth); only backend for the `tools` suite (OpenAI `tools` parameter) |
+| `dsh` | ✅ | `dsh --profile headless --patch <overlay>`, model routed via a per-run overlay (`--dsh-provider`); prints the final assistant message, no usage → tokens estimated (~4 chars/token, `token_source=estimate`) |
+| `codex` | ✅ | `codex exec --json` with `-c` provider overrides pointing at the local endpoint; JSONL events, per-turn `usage` (server-side tokens) |
+| `claude` | ⏳ | `claude -p --output-format stream-json`; needs an **Anthropic-protocol** endpoint (`ANTHROPIC_BASE_URL`) — not directly servable by this host's OpenAI-only vLLM (bridge planned) |
+
+CLI backends run the model as a **full agent**: they get a working directory
+(the per-task scratch dir) plus shell/file tools, which is what the `agentic`
+suite exercises. `api`/`dsh`/`codex` were all validated live against
+`qwen3.8` (see *Host facts* below).
 
 ## Metrics (see `metrics_legend` in run.json)
 
-- `ttft_s` — request sent → first **content** token
-- `ttft_first_reasoning_s` — request sent → first **reasoning** token (reasoning models stream thinking before content)
-- `gen_tps` — completion tokens / (end − first token of any kind) → server decode speed incl. reasoning
-- `decode_tps` — content chunks / (end − first content token) → content-only rate (suppressed for windows < 250 ms)
+- `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup, so it's higher than the api figure for the same model)
+- `ttft_first_reasoning_s` — `api` only: request sent → first **reasoning** token (reasoning models stream thinking before content)
+- `gen_tps` — completion tokens / (end − first output). For `api` this is the server decode rate (incl. reasoning); for buffered CLIs it is suppressed when the window < 1 s
+- `decode_tps` — content chunks / (end − ttft) → content-only rate, `api` only (suppressed for windows < 250 ms)
 - `overall_tps` — completion tokens / total latency (incl. TTFT)
-- tokens — from server `usage`; `completion_tokens` **includes reasoning tokens**
+- tokens — from server `usage` when the CLI reports it (`token_source=server`); else ~4 chars/token estimate (`token_source=estimate`, e.g. `dsh`). `completion_tokens` **includes reasoning tokens**
 
-CLI backends (phase 2) report TTFT as time-to-first-stdout-byte, which
-includes harness overhead; the `api` backend is the reference for pure
-server metrics.
+The `api` backend is the reference for pure server metrics; CLI numbers include harness startup.
 
 ## Resource sampling
 
@@ -63,8 +71,9 @@ task:
   (~1.7 s/call), so NPU readings run in their own loop and the latest reading
   is attached to each fast /proc sample.
 - **System**: CPU %, RAM used/total, page cache (Cached+SReclaimable), swap.
-- **Process tree** (phase 2, for CLI backends): CPU % and RSS of the CLI
-  process and descendants.
+- **Process tree** (CLI backends): CPU % and RSS of the CLI process and all
+  its descendants — attached via `set_root(pid)` right after spawn, so the
+  sample window covers the whole agent run.
 
 Per-chip aggregates (avg/min/peak/p50/p95) land in each task's `resources`
 block and in the report's Resources section.
@@ -80,8 +89,9 @@ needed). Select with `--suites` (comma-separated; default = all).
 | `reasoning` | 8 | word problems, knights-&-knaves, syllogisms, sequences, logic fallacies | `ANSWER:` contract + numeric/string equivalence |
 | `spatial` | 8 | seeded CLEVR-style 3D table scenes (count/compare/relational), grid shortest path (length + move string), map directions, rotation, cube counting | math / answer / move-string simulation on the grid |
 | `ifeval` | 8 | programmatically checkable constraints (exact sentence/word counts, keyword include/exclude, JSON-only shape, line prefixes, casing, punctuation bans, first line) | constraint checkers (all must pass) |
-| `coding` | 8 | original unit-tested problems (anagram, roman, intervals, moving avg, parens, flatten, caesar, top-k) | solution extracted from first ` ```python ` block, unittest suite run in a temp dir (60 s timeout) |
+| `coding` | 8 | original unit-tested problems (anagram, roman, intervals, moving avg, parens, flatten, caesar, top-k) | solution read from `scratch/solution.py` if the agent wrote one, else extracted from the first ` ```python ` block; unittest suite run (60 s timeout) |
 | `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
+| `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude) |
 
 `python3 selftest.py` runs fast offline verifier self-tests.
 
@@ -92,6 +102,11 @@ needed). Select with `--suites` (comma-separated; default = all).
   `qwen3.8` (8× Ascend 910B4 NPUs, 64 GB HBM each).
 - Host `npu-smi` is broken; NPU state is read via
   `docker exec qwen3.8 npu-smi info`.
-- `dsh` headless couldn't be smoke-tested inside the DSH sandbox (it must
-  create `~/.dsh/profiles/headless`); first live check happens on a normal
-  shell.
+- Live validation (all against `qwen3.8`): `api` full 43-task run = 43/43 pass
+  (gen ~88 tok/s, TTFT p50 2.5 s); `dsh` smoke 3/3, coding 1/1 (agent wrote
+  `solution.py` in scratch); `codex` smoke 1/1 + agentic 5/5 (including fixing a
+  failing unit test). `claude` untestable on this host (needs Anthropic
+  protocol; vLLM here is OpenAI-only).
+- The DSH file sandbox denies writes to `~/.dsh` and `~/.codex/tmp`; the CLI
+  backends therefore need a one-shot `danger-full-access` escalation in this
+  harness (on a normal shell they just run).

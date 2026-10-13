@@ -49,4 +49,41 @@ v = L.check_constraints(
     {"checks": [{"type": "json", "shape": shape}]})
 assert v["passed"], v
 
+import os, subprocess, tempfile
+
+# --- check_file (agentic): verify a file the agent created in scratch ---
+with tempfile.TemporaryDirectory() as wd:
+    with open(os.path.join(wd, "pong.txt"), "w") as f:
+        f.write("pong")
+    assert L.check_file({"scratch": wd}, {"path": "pong.txt",
+                                          "content": "pong"})["passed"]
+    assert not L.check_file({"scratch": wd}, {"path": "pong.txt",
+                                              "content": "ping"})["passed"]
+    assert not L.check_file({"scratch": wd}, {"path": "missing.txt",
+                                              "content": "x"})["passed"]
+
+# --- check_run (agentic): re-run a command in scratch, all tests must pass ---
+with tempfile.TemporaryDirectory() as wd:
+    with open(os.path.join(wd, "ok.py"), "w") as f:
+        f.write("import json,sys\n"
+                "print(json.dumps({'total':2,'passed':2,'failed':[]}))\n")
+    v = L.check_run({"scratch": wd},
+                    {"cmd": ["python3", "ok.py"], "timeout": 30})
+    assert v["passed"], v
+with tempfile.TemporaryDirectory() as wd:
+    with open(os.path.join(wd, "bad.py"), "w") as f:
+        f.write("import json\n"
+                "print(json.dumps({'total':2,'passed':1,'failed':['x']}))\n")
+    assert not L.check_run({"scratch": wd},
+                           {"cmd": ["python3", "bad.py"],
+                            "timeout": 30})["passed"]
+
+# --- agentic suite wiring: CLI-only filter + setup files ---
+ag = {t["id"]: t for t in L.SUITES["agentic"]}
+assert len(ag) == 5
+assert all(t.get("backends") == ["dsh", "codex", "claude"] for t in ag.values())
+assert "data.txt" in ag["agentic/data-sum"].get("setup", {})
+assert "tools" in {t["id"].split("/")[0] for t in L.SUITES["tools"]}
+assert all(t.get("backends") == ["api"] for t in L.SUITES["tools"])
+
 print("verifier self-tests OK")

@@ -26,6 +26,7 @@ import math
 import operator
 import os
 import platform
+import queue
 import random
 import re
 import shutil
@@ -262,18 +263,24 @@ def read_meminfo() -> dict:
 
 
 class _ProcTree:
-    """CPU% + RSS for a process and its descendants (Linux /proc)."""
+    """CPU% + RSS of a root process and its descendants (Linux /proc).
 
-    def __init__(self):
+    With root_pid set, only the process subtree is counted; the root can be
+    attached later via the constructor (the sampler creates it once the
+    backend has spawned its process).
+    """
+
+    def __init__(self, root_pid: Optional[int] = None):
         self.hz = os.sysconf("SC_CLK_TCK")
+        self.root_pid = root_pid
         self._last_ticks: Optional[float] = None
         self._last_t: Optional[float] = None
         self._last_rss_kb: int = 0
 
     def _scan(self) -> tuple[float, int, list[int]]:
-        total_ticks = 0.0
-        rss_kb = 0
-        pids: list[int] = []
+        pids_of: dict[int, int] = {}   # pid -> ppid
+        ticks_of: dict[int, float] = {}
+        rss_of: dict[int, int] = {}
         try:
             entries = [e for e in os.listdir("/proc") if e.isdigit()]
         except OSError:
@@ -292,20 +299,37 @@ class _ProcTree:
             if len(parts) < 13:
                 continue
             try:
+                ppid = int(parts[1])
                 ticks = (int(parts[11]) + int(parts[12])) / self.hz
             except ValueError:
                 continue
-            total_ticks += ticks
-            pids.append(int(pid))
+            pids_of[int(pid)] = ppid
+            ticks_of[int(pid)] = ticks
             try:
                 with open(f"{path}/status") as f:
                     for line in f:
                         if line.startswith("VmRSS:"):
-                            rss_kb += int(line.split()[1])
+                            rss_of[int(pid)] = int(line.split()[1])
                             break
             except OSError:
                 pass
-        return total_ticks, rss_kb, pids
+        if self.root_pid is None:
+            return sum(ticks_of.values()), sum(rss_of.values()), list(ticks_of)
+        # walk the subtree from the root
+        children: dict[int, list[int]] = {}
+        for pid, ppid in pids_of.items():
+            children.setdefault(ppid, []).append(pid)
+        total_ticks, total_rss, seen = 0.0, 0, []
+        stack = [self.root_pid]
+        while stack:
+            pid = stack.pop()
+            if pid not in ticks_of:
+                continue
+            total_ticks += ticks_of[pid]
+            total_rss += rss_of.get(pid, 0)
+            seen.append(pid)
+            stack.extend(children.get(pid, []))
+        return total_ticks, total_rss, seen
 
     def sample(self) -> Optional[dict]:
         ticks, rss_kb, _pids = self._scan()
@@ -325,16 +349,19 @@ class _ProcTree:
 class ResourceSampler:
     """Background sampler: NPU (slow prober thread) + system /proc (fast loop)."""
 
-    def __init__(self, interval: float, prober: Optional[NPUProber] = None,
-                 root_pid: Optional[int] = None):
+    def __init__(self, interval: float, prober: Optional[NPUProber] = None):
         self.interval = max(0.2, interval)
         self.prober = prober or NPUProber()
         self.samples: list[dict] = []
         self._stop = threading.Event()
         self._latest_npu: Optional[list[dict]] = None
-        self._tree = _ProcTree() if root_pid else None
+        self._tree: Optional[_ProcTree] = None
         self._sys_last: Optional[tuple[int, int]] = None
         self._threads: list[threading.Thread] = []
+
+    def set_root(self, pid: int) -> None:
+        """Attach the CLI process tree to sample (called right after spawn)."""
+        self._tree = _ProcTree(pid)
 
     # -- NPU prober thread ---------------------------------------------------
     def _npu_loop(self) -> None:
@@ -699,7 +726,21 @@ def _extract_code(response: str) -> str:
 
 
 def check_code(ctx: dict, spec: dict) -> dict:
-    code = _extract_code(ctx["response"])
+    # CLI backends usually wrote the solution to a file in the scratch dir;
+    # api backends require extraction from the response text.
+    scratch = ctx.get("scratch")
+    code, source = None, "response"
+    if scratch:
+        sol = os.path.join(scratch, "solution.py")
+        if os.path.isfile(sol):
+            try:
+                with open(sol) as f:
+                    code = f.read()
+                source = "scratch/solution.py"
+            except OSError:
+                code = None
+    if code is None:
+        code = _extract_code(ctx["response"])
     work = os.path.join(ctx["out_dir"], "code", ctx["task_id"].replace("/", "__"))
     os.makedirs(work, exist_ok=True)
     with open(os.path.join(work, "solution.py"), "w") as f:
@@ -728,8 +769,53 @@ def check_code(ctx: dict, spec: dict) -> dict:
                 "stdout_tail": out[-800:], "stderr_tail": err[-800:],
                 "code_dir": work}
     return {"passed": summary["passed"] == summary["total"],
-            "tests": summary, "code_dir": work,
+            "tests": summary, "source": source, "code_dir": work,
             "stderr_tail": err[-400:]}
+
+
+def check_file(ctx: dict, spec: dict) -> dict:
+    """Verify a file the agent created in the scratch dir."""
+    p = os.path.join(ctx["scratch"], spec["path"])
+    if not os.path.isfile(p):
+        return {"passed": False, "expected": spec.get("content"),
+                "actual": None, "detail": "file missing"}
+    with open(p) as f:
+        content = f.read()
+    ok = True
+    if spec.get("content") is not None:
+        ok = ok and content == spec["content"]
+    if "regexp" in spec:
+        ok = ok and bool(re.search(spec["regexp"], content, re.S))
+    return {"passed": ok, "expected": spec.get("content"),
+            "actual": content[:200]}
+
+
+def check_run(ctx: dict, spec: dict) -> dict:
+    """Run a command in the scratch dir (post-task) and require all tests pass."""
+    cmd = spec["cmd"]
+    if isinstance(cmd, str):
+        import shlex
+        cmd = shlex.split(cmd)
+    try:
+        proc = subprocess.run(cmd, cwd=ctx["scratch"], capture_output=True,
+                              text=True, timeout=spec.get("timeout", 120))
+        out, err = proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return {"passed": False, "detail": "post-task command timed out"}
+    summary = None
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith('{"total"'):
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+            break
+    if summary is None:
+        return {"passed": False, "detail": "no test summary found",
+                "stdout_tail": out[-600:], "stderr_tail": err[-600:]}
+    return {"passed": summary["passed"] == summary["total"], "tests": summary,
+            "stdout_tail": out[-400:], "stderr_tail": err[-400:]}
 
 
 # --- tool calling -------------------------------------------------------------
@@ -835,7 +921,9 @@ VERIFIERS: dict[str, Callable[[dict, dict], dict]] = {
     "math": check_math,
     "constraints": check_constraints,
     "code": check_code,
+    "file": check_file,
     "gridpath": check_gridpath,
+    "run": check_run,
     "toolcall": check_toolcall,
 }
 
@@ -981,6 +1069,332 @@ class ApiBackend:
     def warmup(self) -> None:
         self.chat([{"role": "user", "content": "Reply with the single word: ready"}])
 
+    def run(self, t: dict, scratch: str,
+            set_root: Callable[[int], None]) -> "TaskOutcome":
+        msgs = []
+        if t.get("system"):
+            msgs.append({"role": "system", "content": t["system"]})
+        msgs.append({"role": "user", "content": t["prompt"]})
+        r = self.chat(msgs, tools=t.get("tools"))
+        o = TaskOutcome(
+            text=r.text, ttft_s=r.ttft_first_content_s,
+            ttft_first_reasoning_s=r.ttft_first_reasoning_s, total_s=r.total_s,
+            prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
+            total_tokens=r.total_tokens, token_source="server",
+            finish_reason=r.finish_reason, error=r.error, tool_calls=r.tool_calls,
+            content_chunks=r.content_chunks, reasoning_chunks=r.reasoning_chunks)
+        return o
+
+
+# ---------------------------------------------------------------------------
+# unified task outcome + CLI backends (dsh / codex / claude)
+# ---------------------------------------------------------------------------
+
+def _est_tokens(s: str) -> int:
+    """Rough token estimate when the CLI reports no usage (~4 chars/token)."""
+    return max(1, len(s) // 4)
+
+
+@dataclass
+class TaskOutcome:
+    text: str = ""
+    ttft_s: Optional[float] = None            # request sent -> first output
+    ttft_first_reasoning_s: Optional[float] = None
+    total_s: float = 0.0
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    token_source: str = "server"              # or "estimate"
+    finish_reason: Optional[str] = None
+    error: Optional[str] = None
+    exit_code: Optional[int] = None
+    stderr_tail: str = ""
+    tool_calls: list = field(default_factory=list)
+    events: list = field(default_factory=list)  # compact event summaries (CLI)
+    content_chunks: Optional[int] = None
+    reasoning_chunks: Optional[int] = None
+
+
+class CliBackend:
+    """Base for CLI backends: spawn the CLI in a scratch dir and stream stdout.
+
+    TTFT for CLI backends = time to first stdout byte (includes CLI startup;
+    the api backend's TTFT is the server-side request->first-token metric).
+    """
+
+    name = "cli"
+
+    def __init__(self, cfg: "RunConfig"):
+        self.cfg = cfg
+        self._prompt: str = ""
+
+    # -- subclass hooks -------------------------------------------------------
+    def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
+        raise NotImplementedError
+
+    def parse_line(self, outcome: TaskOutcome, line: str) -> None:  # noqa: B027
+        pass
+
+    def finalize(self, outcome: TaskOutcome) -> None:  # noqa: B027
+        if outcome.completion_tokens is None:
+            outcome.completion_tokens = _est_tokens(outcome.text)
+            outcome.prompt_tokens = _est_tokens(self._prompt)
+            outcome.total_tokens = (outcome.prompt_tokens or 0) + \
+                                   (outcome.completion_tokens or 0)
+            outcome.token_source = "estimate"
+        elif outcome.total_tokens is None:
+            outcome.total_tokens = (outcome.prompt_tokens or 0) + \
+                                   (outcome.completion_tokens or 0)
+
+    def warmup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="llmbench-warm-") as wd:
+            self.run({"prompt": "Reply with the single word: ready"}, wd,
+                     lambda pid: None)
+
+    # -- generic process runner ----------------------------------------------
+    def run(self, t: dict, scratch: str,
+            set_root: Callable[[int], None]) -> TaskOutcome:
+        cfg = self.cfg
+        cmd, env = self.build(t, scratch)
+        outcome = TaskOutcome()
+        proc = subprocess.Popen(
+            cmd, cwd=scratch, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        set_root(proc.pid)
+        t0 = time.monotonic()
+        deadline = t0 + cfg.timeout
+
+        q: "queue.Queue" = queue.Queue()
+
+        def reader() -> None:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read1(4096)
+                if not chunk:
+                    break
+                q.put(chunk)
+            q.put(None)
+
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        buf = b""
+        closed = False
+        while not closed:
+            drained = False
+            while not drained:
+                try:
+                    chunk = q.get(timeout=0.1)
+                except queue.Empty:
+                    break
+                drained = True
+                if chunk is None:
+                    closed = True
+                    break
+                if outcome.ttft_s is None and chunk.strip():
+                    outcome.ttft_s = time.monotonic() - t0
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    self.parse_line(outcome, line.decode(errors="replace").rstrip("\r"))
+            if time.monotonic() >= deadline:
+                self._kill(proc)
+                if not outcome.error:
+                    outcome.error = f"timeout after {cfg.timeout:.0f}s"
+                break
+        if buf.strip() and not closed:
+            self.parse_line(outcome, buf.decode(errors="replace").rstrip("\r"))
+        th.join(timeout=5)
+        outcome.exit_code = proc.poll()
+        try:
+            outcome.stderr_tail = proc.stderr.read().decode(errors="replace")[-1200:]
+        except Exception:  # noqa: BLE001
+            pass
+        outcome.total_s = time.monotonic() - t0
+        self.finalize(outcome)
+        return outcome
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    @staticmethod
+    def full_prompt(t: dict) -> str:
+        p = t["prompt"]
+        return (t["system"] + "\n\n" + p) if t.get("system") else p
+
+
+class DshBackend(CliBackend):
+    """dsh --profile headless — one task, prints the final assistant message."""
+
+    name = "dsh"
+
+    def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
+        cfg = self.cfg
+        self._prompt = self.full_prompt(t)
+        patch = os.path.join(scratch, "llmbench.patch.yaml")
+        with open(patch, "w") as f:
+            f.write(
+                "- id: agent-default-model\n"
+                "  name: '@deepseek-ai/dsh-agent-default-model'\n"
+                "  config:\n"
+                f"    provider: {cfg.dsh_provider}\n"
+                f"    model: {cfg.model}\n")
+        cmd = ["dsh", "--profile", "headless", "--patch", patch, self._prompt]
+        env = dict(os.environ)
+        env[cfg.dsh_api_key_env] = cfg.api_key
+        return cmd, env
+
+    def parse_line(self, outcome: TaskOutcome, line: str) -> None:
+        outcome.text += line + "\n"
+        outcome.finish_reason = "stop"
+
+    def finalize(self, outcome: TaskOutcome) -> None:
+        outcome.text = outcome.text.strip()
+        super().finalize(outcome)
+        if outcome.exit_code not in (0, None) and not outcome.text:
+            outcome.error = f"dsh exit {outcome.exit_code}: {outcome.stderr_tail[-300:]}"
+
+
+class CodexBackend(CliBackend):
+    """codex exec --json — JSONL events incl. per-turn token usage."""
+
+    name = "codex"
+
+    def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
+        cfg = self.cfg
+        prov = cfg.codex_provider
+        self._prompt = self.full_prompt(t)
+        cmd = [
+            "codex", "exec", "--json", "--skip-git-repo-check", "--ephemeral",
+            "-C", scratch, "-m", cfg.model,
+            "-c", f'model_provider="{prov}"',
+            "-c", f'model_providers.{prov}.base_url="{cfg.endpoint}"',
+            "-c", f'model_providers.{prov}.name="{prov}"',
+            "--dangerously-bypass-approvals-and-sandbox", self._prompt,
+        ]
+        env = dict(os.environ)
+        env["OPENAI_API_KEY"] = cfg.api_key
+        return cmd, env
+
+    def parse_line(self, outcome: TaskOutcome, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if ev.get("type") == "item.completed":
+            item = ev.get("item") or {}
+            it = item.get("type")
+            if it == "agent_message":
+                outcome.text = item.get("text", "")
+                outcome.finish_reason = "stop"
+            elif it == "error":
+                outcome.events.append({"event": "error_item",
+                                      "message": item.get("message")})
+            elif it == "command_execution":
+                outcome.events.append({
+                    "event": "command",
+                    "command": (item.get("command") or "")[:300],
+                    "exit_code": item.get("exit_code")})
+            else:
+                outcome.events.append({"event": it})
+        elif ev.get("type") == "turn.completed":
+            usage = ev.get("usage") or {}
+            outcome.prompt_tokens = usage.get("input_tokens")
+            outcome.completion_tokens = usage.get("output_tokens")
+            outcome.token_source = "server"
+            outcome.events.append({"event": "turn.completed",
+                                   "usage": usage})
+
+    def finalize(self, outcome: TaskOutcome) -> None:
+        outcome.text = outcome.text.strip()
+        super().finalize(outcome)
+        if not outcome.text and not outcome.error:
+            if outcome.exit_code not in (0, None):
+                outcome.error = (f"codex exit {outcome.exit_code}: "
+                                 f"{outcome.stderr_tail[-300:]}")
+            else:
+                outcome.error = "no agent_message received"
+
+
+class ClaudeBackend(CliBackend):
+    """claude -p --output-format stream-json (Anthropic-protocol endpoint)."""
+
+    name = "claude"
+
+    def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
+        cfg = self.cfg
+        self._prompt = t["prompt"]
+        root = cfg.endpoint[:-3] if cfg.endpoint.endswith("/v1") else cfg.endpoint
+        cmd = ["claude", "-p", "--output-format", "stream-json",
+              "--model", cfg.model,
+              "--dangerously-skip-permissions",
+              "--no-session-persistence", t["prompt"]]
+        if t.get("system"):
+            cmd += ["--append-system-prompt", t["system"]]
+        env = dict(os.environ)
+        env["ANTHROPIC_BASE_URL"] = root
+        env["ANTHROPIC_AUTH_TOKEN"] = cfg.api_key
+        return cmd, env
+
+    def parse_line(self, outcome: TaskOutcome, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("{"):
+            if line:
+                outcome.text += line + "\n"
+            return
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if ev.get("type") == "assistant":
+            for blk in (ev.get("message") or {}).get("content") or []:
+                if blk.get("type") == "text" and blk.get("text"):
+                    outcome.text += blk["text"]
+                    outcome.finish_reason = "stop"
+        elif ev.get("type") == "result":
+            if ev.get("result"):
+                outcome.text = ev["result"]
+            u = ev.get("usage") or {}
+            outcome.prompt_tokens = u.get("input_tokens")
+            outcome.completion_tokens = u.get("output_tokens")
+            if outcome.prompt_tokens is not None and \
+                    outcome.completion_tokens is not None:
+                outcome.total_tokens = (outcome.prompt_tokens
+                                        + outcome.completion_tokens)
+            outcome.token_source = "server"
+            if ev.get("subtype"):
+                outcome.finish_reason = ev["subtype"]
+            outcome.events.append({"event": "result", "usage": u})
+
+    def finalize(self, outcome: TaskOutcome) -> None:
+        super().finalize(outcome)
+        if not outcome.text and not outcome.error:
+            outcome.error = (f"claude exit {outcome.exit_code}: "
+                             f"{outcome.stderr_tail[-300:]}") or "no result event"
+
+
+def build_backend(cfg: "RunConfig"):
+    if cfg.backend == "api":
+        return ApiBackend(cfg.endpoint, cfg.model, api_key=cfg.api_key,
+                          max_tokens=cfg.max_tokens, temperature=cfg.temperature,
+                          timeout=cfg.timeout)
+    if cfg.backend == "dsh":
+        return DshBackend(cfg)
+    if cfg.backend == "codex":
+        return CodexBackend(cfg)
+    if cfg.backend == "claude":
+        return ClaudeBackend(cfg)
+    raise SystemExit(f"unknown backend '{cfg.backend}'")
+
 
 # ---------------------------------------------------------------------------
 # benchmark suites — all tasks are original and deterministic (no downloads)
@@ -997,8 +1411,10 @@ CONTRACT = (
 )
 
 CODE_CONTRACT = (
-    "\n\nProvide your complete solution as ONE ```python fenced code block "
-    "containing the function(s) (imports allowed)."
+    "\n\nWrite your complete solution to a file named solution.py in the current "
+    "working directory (if you cannot write files, provide the complete solution "
+    "as ONE ```python fenced code block instead). The file must contain the "
+    "function(s) (imports allowed)."
 )
 
 SMOKE_TASKS: list[dict] = [
@@ -1530,6 +1946,80 @@ TOOLS_TASKS: list[dict] = [
          system=TOOL_SYSTEM, tools=[T_STOCK]),
 ]
 
+# --- agentic (CLI backends: real shell + file access) -----------------------
+
+CLI_BACKENDS = ["dsh", "codex", "claude"]
+
+BUGGY_PY = '''def double_total(nums):
+    total = 0
+    for n in nums:
+        total += n
+    return total
+'''
+
+BUGGY_TESTS = '''import unittest
+from buggy import double_total
+
+
+class Test(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(double_total([1, 2, 3]), 12)
+
+    def test_empty(self):
+        self.assertEqual(double_total([]), 0)
+
+    def test_negative(self):
+        self.assertEqual(double_total([-1, 2, -3]), -4)
+
+
+if __name__ == "__main__":
+    import json as _json, sys as _sys
+    _runner = unittest.TextTestRunner(verbosity=0)
+    _res = _runner.run(unittest.defaultTestLoader.loadTestsFromModule(_sys.modules[__name__]))
+    _fails = [str(t).split("\\n")[0]
+              for t, _tb in list(_res.failures) + list(_res.errors)]
+    print(_json.dumps({"total": _res.testsRun,
+                       "passed": _res.testsRun - len(_fails),
+                       "failed": _fails}))
+'''
+
+AGENTIC_TASKS: list[dict] = [
+    task("agentic/file-create",
+         "Create a file called pong.txt in the current working directory "
+         "containing exactly pong (no trailing newline). Then reply with the "
+         "file's content.",
+         {"type": "file", "path": "pong.txt", "content": "pong"},
+         backends=CLI_BACKENDS),
+    task("agentic/data-sum",
+         "Read data.txt in the current working directory and sum all the "
+         "numbers in it. End your final reply with exactly one line in the "
+         "form: ANSWER: <value>",
+         {"type": "math", "value": 130},
+         setup={"data.txt": "3\n14\n15\n92\n6\n"},
+         backends=CLI_BACKENDS),
+    task("agentic/calc-shell",
+         "Use a shell command (for example: python3 -c) in the current working "
+         "directory to compute 128*46. Show the command you ran, then end your "
+         "final reply with exactly one line in the form: ANSWER: <value>",
+         {"type": "math", "value": 5888},
+         backends=CLI_BACKENDS),
+    task("agentic/poem-words",
+         "Write and run a small script in the current working directory that "
+         "counts the number of whitespace-separated words in poem.txt. End "
+         "your final reply with exactly one line in the form: ANSWER: <value>",
+         {"type": "math", "value": 10},
+         setup={"poem.txt": "Twinkle twinkle little star\nHow I wonder what you are\n"},
+         backends=CLI_BACKENDS),
+    task("agentic/fix-bug",
+         "tests.py in the current working directory is failing. Read buggy.py "
+         "and tests.py, then fix buggy.py so that `python3 tests.py` passes all "
+         "tests. Do not modify tests.py. Reply with a one-line summary of the "
+         "fix.",
+         {"type": "run", "cmd": ["python3", "tests.py"], "timeout": 120},
+         setup={"buggy.py": BUGGY_PY, "tests.py": BUGGY_TESTS},
+         backends=CLI_BACKENDS),
+]
+
 SUITES: dict[str, list[dict]] = {
     "smoke": SMOKE_TASKS,
     "reasoning": REASONING_TASKS,
@@ -1537,7 +2027,11 @@ SUITES: dict[str, list[dict]] = {
     "ifeval": IFEVAL_TASKS,
     "coding": CODING_TASKS,
     "tools": TOOLS_TASKS,
+    "agentic": AGENTIC_TASKS,
 }
+# the tools suite (OpenAI `tools` parameter) only makes sense on the api backend
+for _t in TOOLS_TASKS:
+    _t.setdefault("backends", ["api"])
 
 
 # ---------------------------------------------------------------------------
@@ -1560,6 +2054,9 @@ class RunConfig:
     max_request_tokens: int
     warmup: bool
     npu_container: Optional[str]
+    dsh_provider: str
+    dsh_api_key_env: str
+    codex_provider: str
 
     @property
     def out_id(self) -> str:
@@ -1567,16 +2064,20 @@ class RunConfig:
         return f"{stamp}_{self.model}_{self.backend}"
 
 
-def selected_tasks(cfg: RunConfig) -> list[dict]:
+def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int]:
     out: list[dict] = []
+    skipped = 0
     for suite_name, tasks_ in SUITES.items():
         if cfg.suites and suite_name not in cfg.suites:
             continue
         for t in tasks_:
             if cfg.tasks and t["id"] not in cfg.tasks:
                 continue
+            if t.get("backends") and cfg.backend not in t["backends"]:
+                skipped += 1
+                continue
             out.append(t)
-    return out
+    return out, skipped
 
 
 def console_line(r: dict) -> str:
@@ -1605,7 +2106,9 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
         + (f" (container {prober.container})" if prober.container else ""))
 
     backend = build_backend(cfg)
-    tasks = selected_tasks(cfg)
+    tasks, skipped = selected_tasks(cfg)
+    if skipped:
+        log(f"[llmbench] {skipped} task(s) skipped (backend '{cfg.backend}' not supported)")
     if not tasks:
         log("[llmbench] no tasks matched; nothing to do")
         sys.exit(2)
@@ -1620,17 +2123,21 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             "repeat": cfg.repeat, "max_tokens": cfg.max_tokens,
             "temperature": cfg.temperature, "timeout_s": cfg.timeout,
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
+            "dsh_provider": cfg.dsh_provider,
+            "codex_provider": cfg.codex_provider,
         },
         "host": host_facts(),
         "metrics_legend": {
-            "ttft_s": "request sent -> first content token (s)",
-            "ttft_first_reasoning_s": "request sent -> first reasoning token (s)",
-            "total_s": "request sent -> stream closed (s)",
-            "decode_tps": "content chunks / (total - ttft) — content-only rate",
-            "gen_tps": "completion tokens / (total - first any token) — incl. reasoning",
+            "ttft_s": ("api: request sent -> first content token. "
+                        "cli: spawn -> first stdout byte (includes CLI startup)"),
+            "ttft_first_reasoning_s": "api only: request sent -> first reasoning token",
+            "total_s": "api: request sent -> stream closed. cli: spawn -> process exit",
+            "decode_tps": "content chunks / (total - ttft) — content-only rate (api only)",
+            "gen_tps": "completion tokens / (total - first any output) — incl. reasoning",
             "overall_tps": "completion tokens / total — incl. TTFT",
-            "tokens": "from server usage; completion includes reasoning tokens",
-            "resources": "sampled at --sample-interval; chip stats are avg/min/peak/p50/p95",
+            "tokens": "server usage when reported (token_source=server), else ~4 chars/token estimate",
+            "resources": ("sampled at --sample-interval; chip stats are avg/min/peak/p50/p95; "
+                           "proc_cpu_pct/proc_rss_mb cover the CLI process tree on cli backends"),
         },
         "tasks": [],
         "totals": {},
@@ -1652,48 +2159,47 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
     return run
 
 
-def build_backend(cfg: RunConfig):
-    if cfg.backend == "api":
-        return ApiBackend(cfg.endpoint, cfg.model, api_key=cfg.api_key,
-                          max_tokens=cfg.max_tokens, temperature=cfg.temperature,
-                          timeout=cfg.timeout)
-    raise SystemExit(f"backend '{cfg.backend}' is not implemented yet (phase 2); "
-                      f"use --backend api")
+
 
 
 def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
                  out_dir: str, rep: int, log: Callable[[str], None] = print) -> dict:
     rid = t["id"] if rep == 0 else f"{t['id']}#r{rep}"
+    task_key = rid.replace("/", "__").replace("#", "_")
+    scratch = os.path.join(out_dir, "work", task_key)
+    os.makedirs(scratch, exist_ok=True)
+    for fname, content in (t.get("setup") or {}).items():
+        with open(os.path.join(scratch, fname), "w") as f:
+            f.write(content)
+
     sampler = ResourceSampler(cfg.sample_interval, prober)
     sampler.start()
-    result: ChatResult
     t_start = time.monotonic()
-    if cfg.backend == "api":
-        msgs = []
-        if t.get("system"):
-            msgs.append({"role": "system", "content": t["system"]})
-        msgs.append({"role": "user", "content": t["prompt"]})
-        result = backend.chat(msgs, tools=t.get("tools"))
-    else:  # pragma: no cover — phase 2
-        raise NotImplementedError
-    sampler.stop()
+    try:
+        outcome = backend.run(t, scratch, sampler.set_root)
+    finally:
+        sampler.stop()
     wall = time.monotonic() - t_start
+    result = outcome  # unified TaskOutcome
 
     res: dict[str, Any] = {
         "id": rid,
         "task_id": t["id"],
         "suite": t["suite"],
         "repeat": rep,
+        "backend": cfg.backend,
         "status": "pass" if not result.error else "error",
         "response": result.text,
         "ttft_first_reasoning_s": result.ttft_first_reasoning_s,
-        "ttft_s": result.ttft_first_content_s,
+        "ttft_s": result.ttft_s,
         "total_s": round(result.total_s, 3),
         "wall_s": round(wall, 3),
         "finish_reason": result.finish_reason,
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
         "total_tokens": result.total_tokens,
+        "token_source": result.token_source,
+        "exit_code": result.exit_code,
         "content_chunks": result.content_chunks,
         "reasoning_chunks": result.reasoning_chunks,
         "tool_calls": result.tool_calls,
@@ -1703,18 +2209,21 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
         "overall_tps": None,
     }
     # Throughput definitions (see run.json "metrics_legend"):
-    #   ttft_s          request sent -> first content token
-    #   decode_tps      content chunks / (end - first content token)  [content-only rate]
-    #   gen_tps        completion tokens / (end - first any token)   [incl. reasoning]
+    #   ttft_s          first output byte (cli) / first content token (api)
+    #   decode_tps      content chunks / (end - ttft)  [api, content-only rate]
+    #   gen_tps        completion tokens / (end - first any token)
     #   overall_tps    completion tokens / total latency             [incl. TTFT]
     first_any = min(filter(None, (result.ttft_first_reasoning_s,
-                                 result.ttft_first_content_s)), default=None)
-    if result.ttft_first_content_s is not None and \
-            result.total_s > result.ttft_first_content_s and result.content_chunks:
-        content_window = result.total_s - result.ttft_first_content_s
+                                  result.ttft_s)), default=None)
+    if result.ttft_s is not None and result.total_s > result.ttft_s \
+            and result.content_chunks:
+        content_window = result.total_s - result.ttft_s
         if content_window >= 0.25:  # sub-250ms windows are burst noise
             res["decode_tps"] = round(result.content_chunks / content_window, 2)
-    if first_any is not None and result.total_s > first_any and result.completion_tokens:
+    # skip when the "first output" arrived at the very end (buffered CLIs like
+    # dsh headless): the window is noise, not a rate
+    if first_any is not None and result.total_s > first_any \
+            and result.completion_tokens and result.total_s - first_any >= 1.0:
         res["gen_tps"] = round(result.completion_tokens / (result.total_s - first_any), 2)
     if result.completion_tokens and result.total_s > 0:
         res["overall_tps"] = round(result.completion_tokens / result.total_s, 2)
@@ -1727,7 +2236,7 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
                               f"unknown verifier '{t['verify']['type']}'"}
         else:
             ctx = {"response": result.text, "tool_calls": result.tool_calls,
-                   "task_id": rid, "out_dir": out_dir}
+                   "task_id": rid, "out_dir": out_dir, "scratch": scratch}
             res["verdict"] = verifier(ctx, t["verify"])
             res["status"] = "pass" if res["verdict"]["passed"] else "fail"
 
@@ -1738,22 +2247,34 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     # per-task artifacts
     task_dir = os.path.join(out_dir, "tasks")
     os.makedirs(task_dir, exist_ok=True)
-    with open(os.path.join(task_dir, f"{rid.replace('/', '__')}.md"), "w") as f:
+    with open(os.path.join(task_dir, f"{task_key}.md"), "w") as f:
         r3 = lambda v: round(v, 3) if isinstance(v, (int, float)) else v  # noqa: E731
-        f.write(f"# {rid}\n\n- suite: {t['suite']}\n- status: {res['status']}\n"
-                f"- ttft: {r3(res['ttft_s'])}s (first reasoning: {r3(res.get('ttft_first_reasoning_s'))}s)"
-                f"  total: {res['total_s']}s\n"
+        f.write(f"# {rid}\n\n- suite: {t['suite']}\n- backend: {cfg.backend}\n"
+                f"- status: {res['status']}\n"
+                f"- ttft: {r3(res['ttft_s'])}s (first reasoning: "
+                f"{r3(res.get('ttft_first_reasoning_s'))}s)  total: {res['total_s']}s\n"
                 f"- gen: {res.get('gen_tps')} tok/s  decode(content): "
-                f"{res.get('decode_tps')} tok/s  overall: {res.get('overall_tps')} tok/s\n\n")
+                f"{res.get('decode_tps')} tok/s  overall: {res.get('overall_tps')} tok/s\n"
+                f"- tokens ({res['token_source']}): prompt {res.get('prompt_tokens')} / "
+                f"completion {res.get('completion_tokens')} / total "
+                f"{res.get('total_tokens')}\n\n")
         f.write(f"## Prompt\n\n```\n{t['prompt']}\n```\n\n")
-        if result.reasoning:
+        if getattr(result, "reasoning", None):
             f.write(f"## Reasoning\n\n```\n{result.reasoning}\n```\n\n")
         f.write(f"## Response\n\n```\n{result.text or '(empty)'}\n```\n\n")
+        if result.tool_calls:
+            f.write("## Tool calls\n\n```json\n"
+                     f"{json.dumps(result.tool_calls, indent=2)}\n```\n\n")
+        if result.events:
+            f.write("## CLI events\n\n```json\n"
+                     f"{json.dumps(result.events, indent=2)[:6000]}\n```\n\n")
         if res.get("verdict"):
             f.write(f"## Verdict\n\n```json\n{json.dumps(res['verdict'], indent=2)}\n```\n")
+        if result.stderr_tail:
+            f.write(f"## CLI stderr (tail)\n\n```\n{result.stderr_tail}\n```\n")
         if result.error:
             f.write(f"\n## Error\n\n```\n{result.error}\n```\n")
-    with open(os.path.join(task_dir, f"{rid.replace('/', '__')}.samples.jsonl"), "w") as f:
+    with open(os.path.join(task_dir, f"{task_key}.samples.jsonl"), "w") as f:
         for s in sampler.samples:
             f.write(json.dumps(s) + "\n")
     return res
@@ -1985,6 +2506,14 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--warmup", dest="warmup", action="store_true", default=True)
     pr.add_argument("--no-warmup", dest="warmup", action="store_false")
     pr.add_argument("--npu-container", default=os.environ.get("LLMBENCH_NPU_CONTAINER"))
+    pr.add_argument("--dsh-provider", default=os.environ.get("LLMBENCH_DSH_PROVIDER",
+                                                             "my-gateway"),
+                    help="provider entry in ~/.dsh/settings.yaml (default: my-gateway)")
+    pr.add_argument("--dsh-api-key-env", default="MY_GATEWAY_API_KEY",
+                    help="env var name dsh reads the provider API key from")
+    pr.add_argument("--codex-provider", default=os.environ.get("LLMBENCH_CODEX_PROVIDER",
+                                                               "vllm"),
+                    help="codex model_providers entry name (default: vllm)")
     pr.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                    "results"))
     pr.set_defaults(func=cmd_run)
@@ -2001,15 +2530,81 @@ def build_parser() -> argparse.ArgumentParser:
     prpt = sub.add_parser("report", help="re-render report.md from an existing run dir")
     prpt.add_argument("run_dir")
     prpt.set_defaults(func=cmd_report)
+
+    pc = sub.add_parser("compare", help="compare multiple run dirs side by side")
+    pc.add_argument("run_dirs", nargs="+")
+    pc.add_argument("--save", default="", help="also write the table to this .md file")
+    pc.set_defaults(func=cmd_compare)
     return p
 
 
 def cmd_list(_: argparse.Namespace) -> None:
-    print(f"{'task id':<28} {'verifier':<10}")
+    print(f"{'task id':<28} {'verifier':<12} {'backends':<26}")
     for suite_name, tasks_ in SUITES.items():
         print(f"\n[{suite_name}]")
         for t in tasks_:
-            print(f"  {t['id']:<28} {t['verify']['type']:<10}")
+            bks = ",".join(t.get("backends", ["api", "dsh", "codex", "claude"]))
+            print(f"  {t['id']:<28} {t['verify']['type']:<12} {bks:<26}")
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    runs = []
+    for d in args.run_dirs:
+        with open(os.path.join(d, "run.json")) as f:
+            run = json.load(f)
+        cfg = run["config"]
+        label = f"{cfg['backend']}/{cfg['model']}"
+        runs.append((label, run))
+
+    suites: list[str] = []
+    for _, run in runs:
+        for s in run["totals"]["suites"]:
+            if s not in suites:
+                suites.append(s)
+
+    L: list[str] = []
+    L.append("# llmbench compare\n")
+    hdr = "| metric | " + " | ".join(label for label, _ in runs) + " |"
+    L.append(hdr)
+    L.append("|---|" + "---|" * len(runs))
+
+    def row(name: str, vals: list[str]) -> None:
+        L.append(f"| {name} | " + " | ".join(vals) + " |")
+
+    for suite in suites:
+        vals = []
+        for _, run in runs:
+            s = run["totals"]["suites"].get(suite)
+            if not s:
+                vals.append("—")
+            elif s["pass_rate"] is None:
+                vals.append(f"0/{s['n']} (no verdicts)")
+            else:
+                vals.append(f"{s['passed']}/{s['n']} "
+                            f"({s['pass_rate'] * 100:.1f}%)")
+        row(suite, vals)
+
+    def avgp95(run: dict, key: str) -> str:
+        d = run["totals"].get(key) or {}
+        if not d:
+            return "—"
+        return f"avg {d.get('avg')} / p95 {d.get('p95')}"
+
+    row("TTFT (s)", [avgp95(run, "ttft_s") for _, run in runs])
+    row("total latency (s)", [avgp95(run, "total_s") for _, run in runs])
+    row("gen tok/s", [avgp95(run, "gen_tps") for _, run in runs])
+    row("decode tok/s", [avgp95(run, "decode_tps") for _, run in runs])
+    row("prompt tokens", [str(run["totals"]["prompt_tokens"]) for _, run in runs])
+    row("completion tokens", [str(run["totals"]["completion_tokens"]) for _, run in runs])
+    row("total tokens", [str(run["totals"]["total_tokens"]) for _, run in runs])
+    row("n tasks", [str(run["totals"]["n_tasks"]) for _, run in runs])
+
+    table = "\n".join(L)
+    print(table)
+    if args.save:
+        with open(args.save, "w") as f:
+            f.write(table + "\n")
+        print(f"[llmbench] wrote {args.save}")
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -2033,6 +2628,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         temperature=args.temperature, timeout=args.timeout,
         sample_interval=args.sample_interval, max_request_tokens=0,
         warmup=args.warmup, npu_container=args.npu_container,
+        dsh_provider=args.dsh_provider, dsh_api_key_env=args.dsh_api_key_env,
+        codex_provider=args.codex_provider,
     )
     out_dir = os.path.join(args.out, cfg.out_id)
     os.makedirs(out_dir, exist_ok=True)
