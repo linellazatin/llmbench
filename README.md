@@ -117,6 +117,15 @@ needed). Select with `--suites` (comma-separated; default = all).
   `codex` agentic 5/5 (including fixing a failing unit test); `claude` smoke
   3/3 + agentic 5/5 — all CLIs fixed `buggy.py` and created exact-content
   files. vLLM 0.23.0 serves Anthropic `/v1/messages` natively (no bridge).
+- **Definitive 4-backend baseline (2026-10-13, runs 20261013-1718…1742,
+  sequential on the shared endpoint):** 163/163 task-runs passed
+  (api 43 + dsh 40 + codex 40 + claude 40). Standout numbers: api TTFT avg
+  4.7 s / gen 84 tok/s (content decode 27 tok/s); dsh is buffered (TTFT ≈
+  total, ~12 s) with no token usage (estimated); codex has the lowest TTFT
+  (0.36 s — events stream early) but a ~16 s per-task overhead; claude ~12 s
+  per task. Prompt-token cost of the CLI harnesses dwarfs the prompt itself
+  (codex ~593k, claude ~1.16M across 40 tasks vs api 7.8k) — expected, and
+  visible in the `compare` table.
 - The DSH file sandbox denies writes to `~/.dsh` and `~/.codex/tmp`; the CLI
   backends therefore need a one-shot `danger-full-access` escalation in this
   harness (on a normal shell they just run).
