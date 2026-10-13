@@ -40,7 +40,7 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 | backend | status | how |
 |---|---|---|
 | `api` | ✅ | direct streaming `/chat/completions` against an OpenAI-compatible endpoint — cleanest TTFT/tok/s/token numbers (ground truth); only backend for the `tools` suite (OpenAI `tools` parameter) |
-| `dsh` | ✅ | `dsh --profile headless --patch <overlay>`, model routed via a per-run overlay (`--dsh-provider`); prints the final assistant message, no usage → tokens estimated (~4 chars/token, `token_source=estimate`) |
+| `dsh` | ✅ | `dsh --profile headless --patch <overlay>`; the per-run overlay defines a **self-contained provider** (`baseURL` from `--endpoint`, key from `--dsh-api-key-env`, model) plus default-model routing — so `--endpoint` is honored and `~/.dsh/settings.yaml` is never touched. Prints the final assistant message, no usage → tokens estimated (~4 chars/token, `token_source=estimate`) |
 | `codex` | ✅ | `codex exec --json` with `-c` provider overrides pointing at the local endpoint; JSONL events, per-turn `usage` (server-side tokens) |
 | `claude` | ✅ | `claude -p --output-format stream-json --verbose` → `ANTHROPIC_BASE_URL` = endpoint minus `/v1`. **No bridge needed: vLLM ≥ 0.23 serves the Anthropic `/v1/messages` protocol natively** (verified non-streaming + streaming SSE incl. `thinking` blocks). Server-side tokens from the `result` event |
 

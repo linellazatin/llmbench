@@ -1230,7 +1230,13 @@ class CliBackend:
 
 
 class DshBackend(CliBackend):
-    """dsh --profile headless — one task, prints the final assistant message."""
+    """dsh --profile headless — one task, prints the final assistant message.
+
+    The per-run `--patch` overlay defines a self-contained provider
+    (baseURL/api/key-env/models) plus the default-model routing, so
+    `--endpoint` is honored exactly like on the codex backend and the
+    user's ~/.dsh/settings.yaml is never touched.
+    """
 
     name = "dsh"
 
@@ -1240,10 +1246,20 @@ class DshBackend(CliBackend):
         patch = os.path.join(scratch, "llmbench.patch.yaml")
         with open(patch, "w") as f:
             f.write(
+                "- id: llm-pi-ai\n"
+                "  name: '@deepseek-ai/dsh-llm-pi-ai'\n"
+                "  config:\n"
+                "    providers:\n"
+                "      llmbench:\n"
+                f"        baseURL: {cfg.endpoint}\n"
+                "        api: openai-completions\n"
+                f"        apiKeyEnv: {cfg.dsh_api_key_env}\n"
+                "        models:\n"
+                f"          - id: {cfg.model}\n"
                 "- id: agent-default-model\n"
                 "  name: '@deepseek-ai/dsh-agent-default-model'\n"
                 "  config:\n"
-                f"    provider: {cfg.dsh_provider}\n"
+                "    provider: llmbench\n"
                 f"    model: {cfg.model}\n")
         cmd = ["dsh", "--profile", "headless", "--patch", patch, self._prompt]
         env = dict(os.environ)
@@ -2083,7 +2099,6 @@ class RunConfig:
     max_request_tokens: int
     warmup: bool
     npu_container: Optional[str]
-    dsh_provider: str
     dsh_api_key_env: str
     codex_provider: str
 
@@ -2152,7 +2167,6 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             "repeat": cfg.repeat, "max_tokens": cfg.max_tokens,
             "temperature": cfg.temperature, "timeout_s": cfg.timeout,
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
-            "dsh_provider": cfg.dsh_provider,
             "codex_provider": cfg.codex_provider,
         },
         "host": host_facts(),
@@ -2535,11 +2549,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--warmup", dest="warmup", action="store_true", default=True)
     pr.add_argument("--no-warmup", dest="warmup", action="store_false")
     pr.add_argument("--npu-container", default=os.environ.get("LLMBENCH_NPU_CONTAINER"))
-    pr.add_argument("--dsh-provider", default=os.environ.get("LLMBENCH_DSH_PROVIDER",
-                                                             "my-gateway"),
-                    help="provider entry in ~/.dsh/settings.yaml (default: my-gateway)")
     pr.add_argument("--dsh-api-key-env", default="MY_GATEWAY_API_KEY",
-                    help="env var name dsh reads the provider API key from")
+                    help="env var name dsh's per-run provider reads the API key from")
     pr.add_argument("--codex-provider", default=os.environ.get("LLMBENCH_CODEX_PROVIDER",
                                                                "vllm"),
                     help="codex model_providers entry name (default: vllm)")
@@ -2657,7 +2668,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         temperature=args.temperature, timeout=args.timeout,
         sample_interval=args.sample_interval, max_request_tokens=0,
         warmup=args.warmup, npu_container=args.npu_container,
-        dsh_provider=args.dsh_provider, dsh_api_key_env=args.dsh_api_key_env,
+        dsh_api_key_env=args.dsh_api_key_env,
         codex_provider=args.codex_provider,
     )
     out_dir = os.path.join(args.out, cfg.out_id)
