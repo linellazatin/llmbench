@@ -57,18 +57,22 @@ Claude-specific plumbing (non-interactive agentic as root):
   entry for the scratch path in `~/.claude.json`
   (`projects["<scratch>"].hasTrustDialogAccepted = true`) — the documented
   workaround for the untrusted-workspace gate. The trust file is
-  read-modify-written atomically per task.
+  read-modify-written atomically per task, and the entry is removed again when
+  the task finishes. Caveat: the allowlist grants the benchmarked model full
+  `Bash`/`Write` access in the scratch dir — fine on an isolated bench host,
+  not on a machine with anything you care about.
 
 ## Metrics (see `metrics_legend` in run.json)
 
-- `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup, so it's higher than the api figure for the same model)
+- `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup)
+- `ttft_model_s` — request/spawn → first **model-originated** output (codex: first item event; claude: first assistant event; dsh: final message, it buffers). Use this for cross-backend *model* latency — `ttft_s` on a CLI is mostly process startup
 - `ttft_first_reasoning_s` — `api` only: request sent → first **reasoning** token (reasoning models stream thinking before content)
-- `gen_tps` — completion tokens / (end − first output). For `api` this is the server decode rate (incl. reasoning); for buffered CLIs it is suppressed when the window < 1 s
+- `gen_tps` — completion tokens / (end − `ttft_model_s`). For `api` this is the server decode rate (incl. reasoning); on CLI backends it also spans tool round-trips; suppressed when the window < 1 s (buffered CLIs)
 - `decode_tps` — content chunks / (end − ttft) → content-only rate, `api` only (suppressed for windows < 250 ms)
 - `overall_tps` — completion tokens / total latency (incl. TTFT)
-- tokens — from server `usage` when the CLI reports it (`token_source=server`); else ~4 chars/token estimate (`token_source=estimate`, e.g. `dsh`). `completion_tokens` **includes reasoning tokens**
+- tokens — from server `usage` when the CLI reports it (`token_source=server`, cumulative over the task's internal API calls **including the harness system prompt**); else ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`). `completion_tokens` **includes reasoning tokens**
 
-The `api` backend is the reference for pure server metrics; CLI numbers include harness startup.
+The `api` backend is the reference for pure server metrics; CLI numbers include harness overhead. **Run backends sequentially when they share one endpoint** (e.g. this host's single vLLM) — parallel runs contend on the NPU and corrupt each other's latency/throughput.
 
 ## Resource sampling
 

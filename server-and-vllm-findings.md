@@ -40,9 +40,36 @@ Not the running install (red herrings on the host filesystem):
 ## 3. How `qwen3.8` is served
 
 **Container facts** (`docker inspect qwen3.8`):
-- Image: `6c183dfa86cf` (built from an Ascend/vLLM base), created 2026-08-21, up since ~Oct 10
+- Image: `6c183dfa86cf` = `quay.io/ascend/vllm-ascend:v0.23.0-openeuler`, created 2026-08-21, up since ~Oct 10
 - **Network mode: `host`** (no published ports — the vLLM socket is directly the host's `0.0.0.0:8000`)
 - Key bind mounts: `/workspace → /workspace` (model lives here), `/usr/local/Ascend/driver`, `/usr/local/bin/npu-smi`, `/usr/local/dcmi`, `/usr/local/sbin`, `/etc/ascend_install.info`, `/etc/hccn.conf`, TZ `Asia/Shanghai`
+
+**Container launch** (extracted from `/root/.bash_history` line 219; every flag cross-checked against `docker inspect qwen3.8`). Container was created 2026-08-21; since then it's just been `docker start`ed/restarted:
+
+```bash
+docker run --name qwen3.8 -it -d --net=host --ipc=host --shm-size=500g \
+  --privileged=true \
+  -w /home \
+  --device=/dev/davinci_manager \
+  --device=/dev/hisi_hdc \
+  --device=/dev/devmm_svm \
+  --entrypoint=bash \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/sbin:/usr/local/sbin \
+  -v /etc/hccn.conf:/etc/hccn.conf \
+  -v /workspace:/workspace \
+  -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+  6c183dfa86cf
+```
+
+Notes on the launch flags:
+- `--entrypoint=bash` **overrides the image's default entrypoint**, which is `/bin/bash -c "source …/ascend-toolkit/set_env.sh && source …/cann-9.1.0/…/ascendnpu-ir/bin/set_env.sh && source …/nnal/atb/set_env.sh --cxx_abi=… && exec \"$@\""`. Skipping that CANN `set_env.sh` sourcing is safe here because all CANN paths (`PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `ASCEND_*`, `SOC_VERSION`) are already baked into the image's `Env`.
+- `--privileged` is what exposes `/dev/davinci0..7`; the three explicit `--device` flags are redundant but harmless.
+- No `-e` overrides at all: the container's `Env` is byte-identical to the image's (verified by diff).
+- No restart policy; `Tty`/`OpenStdin` set (`-it`); working dir `/home`; shm 500 GiB.
 
 **Launch** — started **Oct 10 from an interactive shell** (pts/1) inside the container (parent is `bash`, PID 32849). No systemd unit, no docker CMD — it's a manual foreground process, kept alive by the open tty session. Full command:
 
@@ -79,6 +106,42 @@ $ curl -s http://127.0.0.1:8000/v1/models
 {"object":"list","data":[{"id":"qwen3.8","owned_by":"vllm",
   "root":"/workspace/Qwen3.8-27B-w8a8/","max_model_len":262144, ...}]}
 ```
+
+### Serving another model from `/workspace`
+
+`/workspace` is bind-mounted, so any model directory under it is already visible inside any new container from the same image — no copying weights. This template mirrors the `qwen3.8` launch verbatim, with the vLLM command attached as the container command:
+
+```bash
+docker run -d --name sample-model --net=host --ipc=host --shm-size=500g \
+  --privileged=true \
+  -w /home \
+  --device=/dev/davinci_manager \
+  --device=/dev/hisi_hdc \
+  --device=/dev/devmm_svm \
+  --entrypoint=bash \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/sbin:/usr/local/sbin \
+  -v /etc/hccn.conf:/etc/hccn.conf \
+  -v /workspace:/workspace \
+  -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+  6c183dfa86cf \
+  -c 'vllm serve /workspace/<model-dir>/ \
+    --host 0.0.0.0 --port 8010 \
+    --served-model-name <name> \
+    --trust-remote-code \
+    --gpu-memory-utilization 0.90'
+```
+
+Because `--entrypoint=bash`, the trailing args run as `bash -c '…'`.
+
+Caveats:
+1. **Port** must differ from 8000 while `qwen3.8` is up (host networking).
+2. **NPU capacity is the real blocker**: `qwen3.8` occupies all 8 NPUs at ~60–62 GB/64 GB HBM per card. A second instance will OOM at startup (its 0.90 × 64 GB target is already consumed). Either stop `qwen3.8` (container stop is what releases NPU memory) if replacing it, or restart it on fewer cards (e.g. `--data-parallel-size 2 --tensor-parallel-size 2`) and pin the new instance to the rest with `-e ASCEND_RT_VISIBLE_DEVICES=4,5,6,7`.
+3. **Don't copy the Qwen-specific flags** from the live command: `--quantization ascend`, `--speculative-config` (qwen3_5_mtp), `--tool-call-parser qwen3_coder`, `--reasoning-parser qwen3`, and `--max-model-len 262144` are specific to the W8A8 Qwen3.8 checkpoint. Size `--tensor-parallel-size` / `--max-model-len` to the new model.
+4. **DSH harness**: to consume it, add a provider entry in `/root/.dsh/settings.yaml` with `baseURL: http://10.199.139.164:<port>/v1` and `models: [<name>]` (must match `--served-model-name`).
 
 ## 4. The provider gateway
 

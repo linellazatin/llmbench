@@ -275,7 +275,6 @@ class _ProcTree:
         self.root_pid = root_pid
         self._last_ticks: Optional[float] = None
         self._last_t: Optional[float] = None
-        self._last_rss_kb: int = 0
 
     def _scan(self) -> tuple[float, int, list[int]]:
         pids_of: dict[int, int] = {}   # pid -> ppid
@@ -335,14 +334,14 @@ class _ProcTree:
         ticks, rss_kb, _pids = self._scan()
         t = time.monotonic()
         if self._last_ticks is None or self._last_t is None:
-            self._last_ticks, self._last_t, self._last_rss_kb = ticks, t, rss_kb
+            self._last_ticks, self._last_t = ticks, t
             return None
         dt = t - self._last_t
         if dt <= 0:
             return None
         cpu_pct = max(0.0, 100.0 * (ticks - self._last_ticks) / dt)
         out = {"cpu_pct": round(cpu_pct, 2), "rss_mb": round(rss_kb / 1024.0, 1)}
-        self._last_ticks, self._last_t, self._last_rss_kb = ticks, t, rss_kb
+        self._last_ticks, self._last_t = ticks, t
         return out
 
 
@@ -1047,8 +1046,6 @@ class ApiBackend:
                         res.completion_tokens = usage.get("completion_tokens")
                         res.total_tokens = usage.get("total_tokens")
                         res.raw_last = usage
-                    if payload == "[DONE]":
-                        break
             for idx in sorted(tc_acc):
                 d = tc_acc[idx]
                 try:
@@ -1077,7 +1074,8 @@ class ApiBackend:
         msgs.append({"role": "user", "content": t["prompt"]})
         r = self.chat(msgs, tools=t.get("tools"))
         o = TaskOutcome(
-            text=r.text, ttft_s=r.ttft_first_content_s,
+            text=r.text, reasoning=r.reasoning, ttft_s=r.ttft_first_content_s,
+            ttft_model_s=r.ttft_first_content_s,
             ttft_first_reasoning_s=r.ttft_first_reasoning_s, total_s=r.total_s,
             prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
             total_tokens=r.total_tokens, token_source="server",
@@ -1098,7 +1096,9 @@ def _est_tokens(s: str) -> int:
 @dataclass
 class TaskOutcome:
     text: str = ""
+    reasoning: str = ""
     ttft_s: Optional[float] = None            # request sent -> first output
+    ttft_model_s: Optional[float] = None      # -> first MODEL-originated output
     ttft_first_reasoning_s: Optional[float] = None
     total_s: float = 0.0
     prompt_tokens: Optional[int] = None
@@ -1210,8 +1210,14 @@ class CliBackend:
         except Exception:  # noqa: BLE001
             pass
         outcome.total_s = time.monotonic() - t0
+        if outcome.ttft_model_s is not None:  # parse_line stored a monotonic clock value
+            outcome.ttft_model_s = round(outcome.ttft_model_s - t0, 3)
         self.finalize(outcome)
+        self.after_run(scratch)
         return outcome
+
+    def after_run(self, scratch: str) -> None:  # noqa: B027
+        pass
 
     @staticmethod
     def _kill(proc: subprocess.Popen) -> None:
@@ -1272,6 +1278,10 @@ class DshBackend(CliBackend):
 
     def finalize(self, outcome: TaskOutcome) -> None:
         outcome.text = outcome.text.strip()
+        # dsh is fully buffered: its only output is the final model message,
+        # so first output byte IS first model output
+        if outcome.ttft_model_s is None:
+            outcome.ttft_model_s = outcome.ttft_s
         super().finalize(outcome)
         if outcome.exit_code not in (0, None) and not outcome.text:
             outcome.error = f"dsh exit {outcome.exit_code}: {outcome.stderr_tail[-300:]}"
@@ -1306,6 +1316,9 @@ class CodexBackend(CliBackend):
             ev = json.loads(line)
         except json.JSONDecodeError:
             return
+        if ev.get("type") in ("item.started", "item.completed") \
+                and outcome.ttft_model_s is None:
+            outcome.ttft_model_s = time.monotonic()  # first model-originated action
         if ev.get("type") == "item.completed":
             item = ev.get("item") or {}
             it = item.get("type")
@@ -1401,6 +1414,8 @@ class ClaudeBackend(CliBackend):
         except json.JSONDecodeError:
             return
         if ev.get("type") == "assistant":
+            if outcome.ttft_model_s is None:
+                outcome.ttft_model_s = time.monotonic()  # first assistant turn
             for blk in (ev.get("message") or {}).get("content") or []:
                 if blk.get("type") == "text" and blk.get("text"):
                     outcome.text += blk["text"]
@@ -1425,6 +1440,30 @@ class ClaudeBackend(CliBackend):
         if not outcome.text and not outcome.error:
             outcome.error = (f"claude exit {outcome.exit_code}: "
                              f"{outcome.stderr_tail[-300:]}") or "no result event"
+
+    def after_run(self, scratch: str) -> None:
+        """Drop this run's trust entry from ~/.claude.json (it was only needed
+        while the task ran; leaving them accumulates dead paths)."""
+        trust = os.path.expanduser("~/.claude.json")
+        if not os.path.isfile(trust):
+            return
+        try:
+            with open(trust) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+        if (data.get("projects") or {}).pop(scratch, None) is None:
+            return
+        tmp = trust + ".llmbench.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, trust)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def build_backend(cfg: "RunConfig"):
@@ -2096,7 +2135,6 @@ class RunConfig:
     temperature: float
     timeout: float
     sample_interval: float
-    max_request_tokens: int
     warmup: bool
     npu_container: Optional[str]
     dsh_api_key_env: str
@@ -2173,12 +2211,19 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
         "metrics_legend": {
             "ttft_s": ("api: request sent -> first content token. "
                         "cli: spawn -> first stdout byte (includes CLI startup)"),
+            "ttft_model_s": ("first MODEL-originated output (api: first token; "
+                              "codex: first item event; claude: first assistant event; "
+                              "dsh: final message, since it buffers) — use this for "
+                              "cross-backend model-latency comparisons"),
             "ttft_first_reasoning_s": "api only: request sent -> first reasoning token",
             "total_s": "api: request sent -> stream closed. cli: spawn -> process exit",
             "decode_tps": "content chunks / (total - ttft) — content-only rate (api only)",
-            "gen_tps": "completion tokens / (total - first any output) — incl. reasoning",
+            "gen_tps": "completion tokens / (total - ttft_model_s); includes tool round-trips on cli backends",
             "overall_tps": "completion tokens / total — incl. TTFT",
-            "tokens": "server usage when reported (token_source=server), else ~4 chars/token estimate",
+            "tokens": ("server usage when reported (token_source=server: codex/claude — "
+                        "cumulative over the task's internal API calls, incl. the "
+                        "harness system prompt), else ~4 chars/token estimate of the "
+                        "task prompt only (token_source=estimate: dsh)"),
             "resources": ("sampled at --sample-interval; chip stats are avg/min/peak/p50/p95; "
                            "proc_cpu_pct/proc_rss_mb cover the CLI process tree on cli backends"),
         },
@@ -2188,7 +2233,10 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
 
     if cfg.warmup:
         log("[llmbench] warmup (unscored) ...")
-        backend.warmup()
+        try:
+            backend.warmup()
+        except Exception as e:  # noqa: BLE001 — warmup is best-effort
+            log(f"[llmbench] warmup failed ({type(e).__name__}: {e}); continuing")
         time.sleep(0.5)
 
     for rep in range(cfg.repeat):
@@ -2220,6 +2268,8 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     t_start = time.monotonic()
     try:
         outcome = backend.run(t, scratch, sampler.set_root)
+    except Exception as e:  # noqa: BLE001 — one bad task must not kill the run
+        outcome = TaskOutcome(error=f"{type(e).__name__}: {e}")
     finally:
         sampler.stop()
     wall = time.monotonic() - t_start
@@ -2235,6 +2285,7 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
         "response": result.text,
         "ttft_first_reasoning_s": result.ttft_first_reasoning_s,
         "ttft_s": result.ttft_s,
+        "ttft_model_s": result.ttft_model_s,
         "total_s": round(result.total_s, 3),
         "wall_s": round(wall, 3),
         "finish_reason": result.finish_reason,
@@ -2253,21 +2304,23 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     }
     # Throughput definitions (see run.json "metrics_legend"):
     #   ttft_s          first output byte (cli) / first content token (api)
+    #   ttft_model_s    first MODEL-originated output (cli startup excluded)
     #   decode_tps      content chunks / (end - ttft)  [api, content-only rate]
-    #   gen_tps        completion tokens / (end - first any token)
+    #   gen_tps        completion tokens / (end - first model output)
     #   overall_tps    completion tokens / total latency             [incl. TTFT]
-    first_any = min(filter(None, (result.ttft_first_reasoning_s,
-                                  result.ttft_s)), default=None)
     if result.ttft_s is not None and result.total_s > result.ttft_s \
             and result.content_chunks:
         content_window = result.total_s - result.ttft_s
         if content_window >= 0.25:  # sub-250ms windows are burst noise
             res["decode_tps"] = round(result.content_chunks / content_window, 2)
+    first_model = result.ttft_model_s if result.ttft_model_s is not None \
+        else result.ttft_s
     # skip when the "first output" arrived at the very end (buffered CLIs like
     # dsh headless): the window is noise, not a rate
-    if first_any is not None and result.total_s > first_any \
-            and result.completion_tokens and result.total_s - first_any >= 1.0:
-        res["gen_tps"] = round(result.completion_tokens / (result.total_s - first_any), 2)
+    if first_model is not None and result.total_s > first_model \
+            and result.completion_tokens and result.total_s - first_model >= 1.0:
+        res["gen_tps"] = round(result.completion_tokens
+                               / (result.total_s - first_model), 2)
     if result.completion_tokens and result.total_s > 0:
         res["overall_tps"] = round(result.completion_tokens / result.total_s, 2)
 
@@ -2323,6 +2376,14 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     return res
 
 
+def _token_source_label(task_results: list[dict]) -> str:
+    srcs = {r.get("token_source") for r in task_results if r.get("token_source")}
+    if len(srcs) == 1:
+        s = next(iter(srcs))
+        return "server" if s == "server" else "estimated"
+    return "mixed" if srcs else "n/a"
+
+
 def compute_totals(task_results: list[dict]) -> dict:
     ok = [r for r in task_results if r.get("status") in ("pass", "fail")]
     by_suite: dict[str, list[dict]] = {}
@@ -2339,6 +2400,7 @@ def compute_totals(task_results: list[dict]) -> dict:
             "pass_rate": round(sum(1 for r in scored if r["verdict"].get("passed"))
                               / len(scored), 3) if scored else None,
             "ttft_s": stats([r["ttft_s"] for r in rs]),
+            "ttft_model_s": stats([r.get("ttft_model_s") for r in rs]),
             "total_s": stats([r["total_s"] for r in rs]),
             "decode_tps": stats([r["decode_tps"] for r in rs]),
             "gen_tps": stats([r["gen_tps"] for r in rs]),
@@ -2371,6 +2433,8 @@ def compute_totals(task_results: list[dict]) -> dict:
         "n_error": sum(1 for r in task_results if r.get("error")),
         "suites": suites_out,
         "ttft_s": stats([r["ttft_s"] for r in ok]),
+        "ttft_model_s": stats([r.get("ttft_model_s") for r in ok]),
+        "token_source": _token_source_label(task_results),
         "total_s": stats([r["total_s"] for r in ok]),
         "decode_tps": stats([r["decode_tps"] for r in ok]),
         "gen_tps": stats([r["gen_tps"] for r in ok]),
@@ -2631,13 +2695,27 @@ def cmd_compare(args: argparse.Namespace) -> None:
         return f"avg {d.get('avg')} / p95 {d.get('p95')}"
 
     row("TTFT (s)", [avgp95(run, "ttft_s") for _, run in runs])
+    row("TTFT-model (s)", [avgp95(run, "ttft_model_s") for _, run in runs])
     row("total latency (s)", [avgp95(run, "total_s") for _, run in runs])
     row("gen tok/s", [avgp95(run, "gen_tps") for _, run in runs])
     row("decode tok/s", [avgp95(run, "decode_tps") for _, run in runs])
-    row("prompt tokens", [str(run["totals"]["prompt_tokens"]) for _, run in runs])
-    row("completion tokens", [str(run["totals"]["completion_tokens"]) for _, run in runs])
-    row("total tokens", [str(run["totals"]["total_tokens"]) for _, run in runs])
+
+    def src(run: dict) -> str:
+        return run["totals"].get("token_source") or _token_source_label(run["tasks"])
+
+    row("prompt tokens",
+        [f"{run['totals']['prompt_tokens']} ({src(run)})" for _, run in runs])
+    row("completion tokens",
+        [f"{run['totals']['completion_tokens']} ({src(run)})" for _, run in runs])
+    row("total tokens",
+        [f"{run['totals']['total_tokens']} ({src(run)})" for _, run in runs])
     row("n tasks", [str(run["totals"]["n_tasks"]) for _, run in runs])
+
+    L.append("")
+    L.append("_TTFT-model excludes CLI startup (use for cross-backend model latency). "
+             "Tokens: `server` = backend-reported (CLI backends include their harness "
+             "system prompt, cumulative over the task's internal API calls); "
+             "`estimated` = ~4 chars/token of the task prompt only (dsh)._")
 
     table = "\n".join(L)
     print(table)
@@ -2666,7 +2744,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         tasks=[t for t in args.tasks.split(",") if t],
         repeat=args.repeat, max_tokens=args.max_tokens,
         temperature=args.temperature, timeout=args.timeout,
-        sample_interval=args.sample_interval, max_request_tokens=0,
+        sample_interval=args.sample_interval,
         warmup=args.warmup, npu_container=args.npu_container,
         dsh_api_key_env=args.dsh_api_key_env,
         codex_provider=args.codex_provider,
