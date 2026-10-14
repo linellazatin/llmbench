@@ -1548,8 +1548,10 @@ class ClaudeBackend(CliBackend):
     def finalize(self, outcome: TaskOutcome) -> None:
         super().finalize(outcome)
         if not outcome.text and not outcome.error:
-            outcome.error = (f"claude exit {outcome.exit_code}: "
-                             f"{outcome.stderr_tail[-300:]}") or "no result event"
+            tail = outcome.stderr_tail[-300:].strip()
+            outcome.error = (f"claude exit {outcome.exit_code}: {tail}"
+                              if tail else
+                              f"no result event (exit {outcome.exit_code})")
 
     def after_run(self, scratch: str) -> None:
         """Drop this run's trust entry from ~/.claude.json (it was only needed
@@ -2563,7 +2565,7 @@ def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int]:
 
 
 def console_line(r: dict) -> str:
-    mark = {"pass": "✓", "fail": "✗", "error": "!", "timeout": "!"}.get(r["status"], "?")
+    mark = {"pass": "✓", "fail": "✗", "error": "!"}.get(r["status"], "?")
     parts = [f"{mark} {r['id']}  {r['status']:<7}"]
     if r.get("total_s") is not None:
         parts.append(f"{r['total_s']:.2f}s")
@@ -3084,8 +3086,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--concurrency", type=int, default=1,
                    help="tasks in flight at once (load mode; >1 shares the endpoint)")
     pr.add_argument("--sample-interval", type=float, default=2.0)
-    pr.add_argument("--warmup", dest="warmup", action="store_true", default=True)
-    pr.add_argument("--no-warmup", dest="warmup", action="store_false")
+    pr.add_argument("--no-warmup", dest="warmup", action="store_false",
+                    default=True,
+                    help="skip the unscored warmup task (default: run one)")
     pr.add_argument("--npu-container", default=os.environ.get("LLMBENCH_NPU_CONTAINER"))
     # per-backend config flags register from the registry (one code path;
     # order = registry order, which matches the historical help layout)
