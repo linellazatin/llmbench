@@ -1566,14 +1566,23 @@ class PiBackend(CliBackend):
         self._prompt = self.full_prompt(t)  # only used for token estimation
         agent_dir = os.path.join(scratch, ".pi-agent")
         os.makedirs(agent_dir, exist_ok=True)
-        # self-contained: pi reads ONLY this file, so no user-model bleed
+        # self-contained: pi reads ONLY this file, so no user-model bleed.
+        # When --pi-thinking is set, declare reasoning + the qwen-chat-template
+        # compat so pi maps the level to the Qwen wire switch
+        # (chat_template_kwargs {enable_thinking: level != "off",
+        # preserve_thinking: true}); default (unset) keeps the wire exactly
+        # as before the flag existed.
+        model_entry = {"id": cfg.model,
+                       "contextWindow": 262144, "maxTokens": 8192}
+        if cfg.pi_thinking:
+            model_entry["reasoning"] = True
+            model_entry["compat"] = {"thinkingFormat": "qwen-chat-template"}
         with open(os.path.join(agent_dir, "models.json"), "w") as f:
             json.dump({"providers": {"llmbench": {
                 "baseUrl": cfg.endpoint,
                 "api": "openai-completions",
                 "apiKey": cfg.api_key,
-                "models": [{"id": cfg.model,
-                            "contextWindow": 262144, "maxTokens": 8192}],
+                "models": [model_entry],
             }}}, f, indent=1)
         cmd = ["pi", "--mode", "json", "--no-session",
                "--provider", "llmbench", "--model", cfg.model,
@@ -1582,6 +1591,8 @@ class PiBackend(CliBackend):
             cmd += ["--append-system-prompt", t["system"]]
         if cfg.pi_tools:
             cmd += ["--tools", cfg.pi_tools]
+        if cfg.pi_thinking:
+            cmd += ["--thinking", cfg.pi_thinking]
         cmd += ["--", t["prompt"]]
         env = dict(os.environ)
         env["PI_CODING_AGENT_DIR"] = agent_dir
@@ -1597,8 +1608,9 @@ class PiBackend(CliBackend):
             return
         et = ev.get("type")
         if et == "message_start":
-            # fresh assistant response: reset the per-response usage tracker
+            # fresh assistant response: reset the per-response trackers
             outcome._pi_pending_usage = None
+            outcome._pi_thinking_buf = ""
             if (ev.get("message") or {}).get("role") == "assistant" \
                     and outcome.ttft_model_s is None:
                 outcome.ttft_model_s = time.monotonic()
@@ -1606,6 +1618,11 @@ class PiBackend(CliBackend):
             u = ev.get("usage") or {}
             if u.get("input") or u.get("output") or u.get("totalTokens"):
                 outcome._pi_pending_usage = u
+            nested = ev.get("assistantMessageEvent") or {}
+            if nested.get("type") == "thinking_delta":
+                # fallback accumulator; the message_end thinking block (when
+                # present) is authoritative and preferred
+                outcome._pi_thinking_buf += nested.get("delta", "")
         elif et == "message_end":
             m = ev.get("message") or {}
             if m.get("role") != "assistant":
@@ -1619,11 +1636,20 @@ class PiBackend(CliBackend):
                 outcome.completion_tokens = (outcome.completion_tokens or 0) \
                     + u.get("output", 0)
                 outcome.token_source = "server"
-            text = "".join(b.get("text", "") for b in m.get("content") or []
+            blocks = m.get("content") or []
+            text = "".join(b.get("text", "") for b in blocks
                            if isinstance(b, dict) and b.get("type") == "text")
             if text:
                 outcome.text = text
                 outcome.finish_reason = m.get("stopReason") or "stop"
+            think = "".join((b.get("thinking") or b.get("text") or "")
+                             for b in blocks
+                             if isinstance(b, dict)
+                             and b.get("type") == "thinking") \
+                or outcome._pi_thinking_buf
+            if think.strip():
+                outcome.reasoning = ((outcome.reasoning + "\n\n" + think.strip())
+                                     if outcome.reasoning else think.strip())
             outcome.events.append({"event": "assistant_message_end",
                                    "stopReason": m.get("stopReason")})
         elif et == "turn_end":
@@ -1672,7 +1698,11 @@ BACKEND_REGISTRY: dict[str, BackendSpec] = {
     "pi": BackendSpec(factory=lambda cfg: PiBackend(cfg), flags=(
         ("--pi-tools", "",
          "pin pi's toolset to this comma-separated allowlist "
-         "(default: pi's full default toolset)"),)),
+         "(default: pi's full default toolset)"),
+        ("--pi-thinking", "",
+         "pi thinking level (off|minimal|low|medium|high|xhigh|max); on "
+         "qwen-style vLLM models the level maps to enable_thinking "
+         "(off=off, other=on); default: model default"),)),
 }
 BACKENDS = list(BACKEND_REGISTRY)  # all known backends
 
@@ -2464,6 +2494,7 @@ class RunConfig:
     dsh_api_key_env: str
     codex_provider: str
     pi_tools: str = ""  # --pi-tools pin; "" = pi's default toolset
+    pi_thinking: str = ""  # --pi-thinking level; "" = pi/model default
 
     @property
     def out_id(self) -> str:
@@ -2545,6 +2576,7 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
             "codex_provider": cfg.codex_provider,
             "pi_tools": cfg.pi_tools,
+            "pi_thinking": cfg.pi_thinking,
         },
         "host": host_facts(),
         "metrics_legend": {
@@ -3161,6 +3193,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         dsh_api_key_env=args.dsh_api_key_env,
         codex_provider=args.codex_provider,
         pi_tools=args.pi_tools,
+        pi_thinking=args.pi_thinking,
     )
     out_dir = os.path.join(args.out, cfg.out_id)
     os.makedirs(out_dir, exist_ok=True)

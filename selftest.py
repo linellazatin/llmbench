@@ -216,6 +216,15 @@ with _tmp.TemporaryDirectory() as scratch:
     assert p["baseUrl"] == "http://127.0.0.1:8000/v1"
     assert p["api"] == "openai-completions" and p["apiKey"] == "llmbench"
     assert p["models"][0]["id"] == "qwen3.8"
+    # thinking declaration: absent by default (wire unchanged); present when
+    # --pi-thinking is set, so pi maps the level to enable_thinking
+    assert "reasoning" not in p["models"][0]
+    assert "compat" not in p["models"][0]
+    _cmdh, _envh = L.PiBackend(_bcfg("pi", pi_thinking="off")).build(BTASK, scratch)
+    mh = _json.load(open(_os.path.join(scratch, ".pi-agent", "models.json")))
+    assert mh["providers"]["llmbench"]["models"][0]["reasoning"] is True
+    assert (mh["providers"]["llmbench"]["models"][0]
+            ["compat"]["thinkingFormat"] == "qwen-chat-template")
     assert "--tools" not in cmd  # default: no pinning
     cmd2, _ = b.build(BTASK, scratch)  # no system -> no append-system-prompt
     assert "--append-system-prompt" not in cmd2 and cmd2[-2:] == ["--", "Say pong."]
@@ -223,6 +232,51 @@ with _tmp.TemporaryDirectory() as scratch:
     cmdt, _ = L.PiBackend(_bcfg("pi", pi_tools="read,bash")).build(BTASK_SYS, scratch)
     assert cmdt[-6:] == ["--append-system-prompt", "You are terse.",
                          "--tools", "read,bash", "--", "Say pong."], cmdt[-6:]
+    # --pi-thinking pinning: absent by default, verbatim when set
+    assert "--thinking" not in cmd
+    cmdh, _ = L.PiBackend(_bcfg("pi", pi_thinking="off")).build(BTASK_SYS, scratch)
+    assert cmdh[-4:] == ["--thinking", "off", "--", "Say pong."], cmdh[-4:]
+    # thinking capture: message_end thinking block is authoritative, with the
+    # thinking_delta buffer as fallback
+    o6 = L.TaskOutcome()
+    for e in [
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "thinking_delta",
+                                    "contentIndex": 0, "delta": "let me "}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "thinking_delta",
+                                    "contentIndex": 0, "delta": "think"}},
+        {"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "stop",
+            "usage": {"input": 10, "output": 5, "totalTokens": 15},
+            "content": [{"type": "thinking", "thinking": "let me think"},
+                        {"type": "text", "text": "42"}]}},
+    ]:
+        b.parse_line(o6, _json.dumps(e))
+    assert o6.reasoning == "let me think", o6.reasoning
+    assert o6.text == "42" and (o6.prompt_tokens, o6.completion_tokens) == (10, 5)
+    o7 = L.TaskOutcome()  # no thinking block in message_end -> delta fallback
+    for e in [
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_update",
+         "assistantMessageEvent": {"type": "thinking_delta",
+                                    "contentIndex": 0, "delta": "abc"}},
+        {"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "stop",
+            "content": [{"type": "text", "text": "x"}]}},
+    ]:
+        b.parse_line(o7, _json.dumps(e))
+    assert o7.reasoning == "abc", o7.reasoning
+    o8 = L.TaskOutcome()  # no thinking at all -> reasoning stays empty
+    for e in [
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "stop",
+            "content": [{"type": "text", "text": "y"}]}},
+    ]:
+        b.parse_line(o8, _json.dumps(e))
+    assert o8.reasoning == ""
 
     o = L.TaskOutcome()
     evs = [
