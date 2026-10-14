@@ -13,9 +13,14 @@ Single file, Python 3.10+ stdlib only, zero dependencies.
 
 ```bash
 # run the smoke suite against the local vLLM endpoint (OpenAI-compatible API)
+# -- adjust --endpoint/--model to your server: any OpenAI-compatible engine
+# works (vLLM, llama.cpp llama-server, Ollama /v1, cloud); the preflight
+# line tells you before the first task whether the endpoint is up and the
+# model is listed
 python3 llmbench.py run --backend api --endpoint http://127.0.0.1:8000/v1 --model qwen3.8
 
-# run the same suite through an agentic CLI backend instead
+# run suites through the agentic CLI backends instead
+# (same endpoint/model, from flags or the LLMBENCH_* env vars)
 python3 llmbench.py run --backend codex --suites agentic
 python3 llmbench.py run --backend dsh --suites reasoning,spatial
 python3 llmbench.py run --backend pi --suites reasoning,coding
@@ -35,6 +40,7 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 | `report.md` | human-readable report (scorecard, latency/throughput, per-chip resources, per-task table) |
 | `tasks/<id>.md` | per-task prompt, reasoning, response, verdict |
 | `tasks/<id>.samples.jsonl` | raw per-interval resource samples |
+| `sample.csv` | per-interval resource time series (accelerator + system columns; one row per interval, all tasks) |
 
 ## Backends
 
@@ -88,15 +94,15 @@ per-task backend gates.
 | `--api-key` | any string | `$LLMBENCH_API_KEY` or `llmbench` | vLLM ignores it, but it is still sent |
 | `--suites` | comma-separated subset of `smoke,reasoning,spatial,ifeval,coding,tools,agentic,mullang,longctx` | all except `longctx` | gated tasks on a non-admitted backend are logged as skipped, not errors |
 | `--tasks` | comma-separated task ids (see `list`), e.g. `reasoning/knights-knaves,coding/caesar` | all in the selected suites | implies the tasks' suites — this is how `longctx` is reachable |
-| `--repeat` | int ≥ 1 | `1` | repeats add 95 % CIs (`*_ci95`) to all aggregates |
+| `--repeat` | int ≥ 1 | `1` | aggregates with ≥ 2 samples gain 95 % CIs (`*_ci95`) |
 | `--max-tokens` | int | `4096` | **effective on `api` and `pi` only** — the other CLIs have no output-budget knob wired |
 | `--temperature` | float | `0.0` | **effective on `api` only** |
 | `--timeout` | float, seconds | `600` | per-task wall limit; a timeout is an `error` (→ retried) |
 | `--retries` | int ≥ 0 | `1` | extra attempts for tasks that **error** only — a verifier fail is a real verdict and is never retried |
 | `--concurrency` | int ≥ 1 | `1` | load mode: N tasks in flight, each keeping its own resource sampler; the shared endpoint is the load target — run backends sequentially, never in parallel |
 | `--sample-interval` | float, seconds | `2.0` | resource-sampling cadence during each task |
-| `--no-warmup` | flag (no value) | warmup runs | skip the single unscored warmup task |
-| `--npu-container` | docker container name | `$LLMBENCH_NPU_CONTAINER` or auto-detect | NPU state via `docker exec <c> npu-smi info` |
+| `--no-warmup` | flag (no value) | warmup runs | skip the single unscored warmup call (one chat request on `api`; a first-pass smoke task on CLI backends) |
+| `--npu-container` | docker container name | `$LLMBENCH_NPU_CONTAINER`, else none | NPU state via `docker exec <c> npu-smi info` (NPU-in-container hosts) |
 | `--out` | directory | `<script dir>/results` | run dirs are created under it |
 
 ### Other commands
@@ -122,11 +128,12 @@ python3 llmbench.py run --backend api --max-tokens 1024 --temperature 0.2 --suit
 
 | item | value |
 |---|---|
-| invocation | `POST <endpoint>/chat/completions` — streaming, `stream_options.include_usage`, `Bearer` auth |
+| invocation | `POST <endpoint>/chat/completions` — streaming, `stream_options.include_usage`, `Bearer` auth. Works against any OpenAI-compatible engine (vLLM, llama.cpp `llama-server`, Ollama `:11434/v1`, cloud) — `/models` preflight warns if the endpoint is down or the model is unlisted |
 | backend-specific flags | — (none) |
+| reasoning | both delta field conventions captured — `reasoning` and `reasoning_content` (engines differ); lands in the task `.md` Reasoning section and sets `ttft_first_reasoning_s` |
 | suites | 8 of 9 (all except CLI-only `agentic`) — 54 admissible, 51 by default (longctx opt-in); the only backend for `tools`, reference for `longctx` |
 | shared flags effective | `--max-tokens` ✓, `--temperature` ✓ (the only backend for both) |
-| tokens / latency | server `usage` (final chunk); `ttft_s` = request → first content token — cleanest numbers, no harness overhead |
+| tokens / latency | server `usage` (final chunk); `ttft_s` = request → first content token — cleanest numbers, no harness overhead. If the engine reports no streamed usage, tokens fall back to the ~4 chars/token estimate (`token_source=estimate`, as on CLI backends) |
 
 ### dsh
 
@@ -219,11 +226,11 @@ rule: backends sharing one endpoint run **sequentially** — never in parallel.
 
 - `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup)
 - `ttft_model_s` — request/spawn → first **model-originated** output (codex: first item event; claude: first assistant event; pi: first assistant event; dsh: final message, it buffers). Use this for cross-backend *model* latency — `ttft_s` on a CLI is mostly process startup
-- `ttft_first_reasoning_s` — `api` only: request sent → first **reasoning** token (reasoning models stream thinking before content)
+- `ttft_first_reasoning_s` — `api`: request sent → first **reasoning** token (both `reasoning` and `reasoning_content` delta fields count; reasoning models stream thinking before content). CLI backends: degenerate (= `ttft_s`)
 - `gen_tps` — completion tokens / (end − `ttft_model_s`). For `api` this is the server decode rate (incl. reasoning); on CLI backends it also spans tool round-trips; suppressed when the window < 1 s (buffered CLIs)
 - `decode_tps` — content chunks / (end − ttft) → content-only rate, `api` only (suppressed for windows < 250 ms)
 - `overall_tps` — completion tokens / total latency (incl. TTFT)
-- tokens — from server `usage` when the CLI reports it (`token_source=server`: codex/claude/pi — cumulative over the task's internal API calls **including the harness system prompt**); else ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`). `completion_tokens` **includes reasoning tokens**
+- tokens — from server `usage` when the backend reports it (`token_source=server`: codex/claude/pi — cumulative over the task's internal API calls **including the harness system prompt**; api — the stream's usage chunk). Otherwise ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`, and `api` against engines with no streamed usage). `completion_tokens` **includes reasoning tokens**
 
 The `api` backend is the reference for pure server metrics; CLI numbers include harness overhead. **Run backends sequentially when they share one endpoint** (e.g. this host's single vLLM) — parallel runs contend on the NPU and corrupt each other's latency/throughput.
 
@@ -261,11 +268,11 @@ opt-in `longctx` suite**, which you must name explicitly).
 | `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
 | `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude, pi) |
 | `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count in Devanagari (hi, `script` check) | existing verifiers (math / gridpath / constraints / answer) + script check |
-| `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — 8k, 32k (3 needles, order), 128k tokens | `ANSWER:` exact/ordered (api + pi; prompts over the CLI per-argument limit ride pi's stdin) |
+| `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — nominal 8k / 32k (3 needles, order) / 128k tokens (32k/128k/512k chars of filler) | `ANSWER:` exact/ordered (api + pi; prompts over the CLI per-argument limit ride pi's stdin) |
 
 `python3 selftest.py` runs fast offline checks: the verifier self-tests plus
-build/parse characterization probes for every CLI backend (no model, no
-network).
+characterization probes for the CLI backends (argv/env/overlay) and the api
+streaming parser (no model, no network).
 
 ## Run modes
 
@@ -285,7 +292,7 @@ network).
   (`*_ci95` fields in `run.json`; `±` in the console summary) so single-run
   wiggles are distinguishable from signal.
 
-## Notes / host facts (2026-10-13)
+## Notes / host facts
 
 - Local model: `qwen3.8` = Qwen3.8-27B-w8a8 (W8A8, 262k ctx, MTP spec-decode)
   served by vLLM 0.23.0 on `0.0.0.0:8000` inside host-networked container
