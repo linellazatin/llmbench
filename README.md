@@ -18,6 +18,7 @@ python3 llmbench.py run --backend api --endpoint http://127.0.0.1:8000/v1 --mode
 # run the same suite through an agentic CLI backend instead
 python3 llmbench.py run --backend codex --suites agentic
 python3 llmbench.py run --backend dsh --suites reasoning,spatial
+python3 llmbench.py run --backend pi --suites reasoning,coding
 
 # browse tasks, re-render a report, compare runs, or monitor resources standalone
 python3 llmbench.py list
@@ -43,10 +44,11 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 | `dsh` | ✅ | `dsh --profile headless --patch <overlay>`; the per-run overlay defines a **self-contained provider** (`baseURL` from `--endpoint`, key from `--dsh-api-key-env`, model) plus default-model routing — so `--endpoint` is honored and `~/.dsh/settings.yaml` is never touched. Prints the final assistant message, no usage → tokens estimated (~4 chars/token, `token_source=estimate`) |
 | `codex` | ✅ | `codex exec --json` with `-c` provider overrides pointing at the local endpoint; JSONL events, per-turn `usage` (server-side tokens) |
 | `claude` | ✅ | `claude -p --output-format stream-json --verbose` → `ANTHROPIC_BASE_URL` = endpoint minus `/v1`. **No bridge needed: vLLM ≥ 0.23 serves the Anthropic `/v1/messages` protocol natively** (verified non-streaming + streaming SSE incl. `thinking` blocks). Server-side tokens from the `result` event |
+| `pi` | ✅ | `pi --mode json --no-session --provider llmbench --model <m> --api-key <k>`; the per-run agent dir under the task scratch (`PI_CODING_AGENT_DIR`) holds a self-contained `models.json` provider (`baseUrl` from `--endpoint`, model, key) — `~/.pi/agent` is never touched, and a bare scratch dir triggers no trust prompt. **No trust/permission plumbing needed** (unlike claude): pi runs tools without per-call approval in one-shot mode. Server-side tokens from per-response `usage` events |
 
 CLI backends run the model as a **full agent**: they get a working directory
 (the per-task scratch dir) plus shell/file tools, which is what the `agentic`
-suite exercises. All four backends are validated live against `qwen3.8` (see
+suite exercises. All five backends are validated live against `qwen3.8` (see
 *Host facts* below).
 
 Claude-specific plumbing (non-interactive agentic as root):
@@ -65,12 +67,12 @@ Claude-specific plumbing (non-interactive agentic as root):
 ## Metrics (see `metrics_legend` in run.json)
 
 - `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup)
-- `ttft_model_s` — request/spawn → first **model-originated** output (codex: first item event; claude: first assistant event; dsh: final message, it buffers). Use this for cross-backend *model* latency — `ttft_s` on a CLI is mostly process startup
+- `ttft_model_s` — request/spawn → first **model-originated** output (codex: first item event; claude: first assistant event; pi: first assistant event; dsh: final message, it buffers). Use this for cross-backend *model* latency — `ttft_s` on a CLI is mostly process startup
 - `ttft_first_reasoning_s` — `api` only: request sent → first **reasoning** token (reasoning models stream thinking before content)
 - `gen_tps` — completion tokens / (end − `ttft_model_s`). For `api` this is the server decode rate (incl. reasoning); on CLI backends it also spans tool round-trips; suppressed when the window < 1 s (buffered CLIs)
 - `decode_tps` — content chunks / (end − ttft) → content-only rate, `api` only (suppressed for windows < 250 ms)
 - `overall_tps` — completion tokens / total latency (incl. TTFT)
-- tokens — from server `usage` when the CLI reports it (`token_source=server`, cumulative over the task's internal API calls **including the harness system prompt**); else ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`). `completion_tokens` **includes reasoning tokens**
+- tokens — from server `usage` when the CLI reports it (`token_source=server`: codex/claude/pi — cumulative over the task's internal API calls **including the harness system prompt**); else ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`). `completion_tokens` **includes reasoning tokens**
 
 The `api` backend is the reference for pure server metrics; CLI numbers include harness overhead. **Run backends sequentially when they share one endpoint** (e.g. this host's single vLLM) — parallel runs contend on the NPU and corrupt each other's latency/throughput.
 
@@ -106,7 +108,7 @@ opt-in `longctx` suite**, which you must name explicitly).
 | `ifeval` | 8 | programmatically checkable constraints (exact sentence/word counts, keyword include/exclude, JSON-only shape, line prefixes, casing, punctuation bans, first line) | constraint checkers (all must pass) |
 | `coding` | 8 | original unit-tested problems (anagram, roman, intervals, moving avg, parens, flatten, caesar, top-k) | solution read from `scratch/solution.py` if the agent wrote one, else extracted from the first ` ```python ` block; unittest suite run (60 s timeout) |
 | `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
-| `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude) |
+| `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude, pi) |
 | `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count in Devanagari (hi, `script` check) | existing verifiers (math / gridpath / constraints / answer) + script check |
 | `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — 8k, 32k (3 needles, order), 128k tokens | `ANSWER:` exact/ordered (api backend only; a 128k-token prompt exceeds the CLI per-argument length limit) |
 
@@ -146,6 +148,13 @@ opt-in `longctx` suite**, which you must name explicitly).
   per task. Prompt-token cost of the CLI harnesses dwarfs the prompt itself
   (codex ~593k, claude ~1.16M across 40 tasks vs api 7.8k) — expected, and
   visible in the `compare` table.
+- **pi backend added (2026-10-14, run 20261014-074156, same host/endpoint):**
+  48/48 task-runs (the 40 shared tasks + 8 `mullang` tasks, which postdate the
+  other CLIs' baselines and are pi-only there) → 211/211 total across the
+  five backends. pi is the fastest CLI backend (total avg 7.3 s vs claude
+  11.6 / dsh 11.8 / codex 16.9 s) and the most token-efficient (279k prompt
+  tokens vs codex 593k / claude 1.16M; dsh 2.9k estimated) — see
+  `results/pi-compare.md`.
 - The DSH file sandbox denies writes to `~/.dsh` and `~/.codex/tmp`; the CLI
   backends therefore need a one-shot `danger-full-access` escalation in this
   harness (on a normal shell they just run).
