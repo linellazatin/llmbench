@@ -78,6 +78,64 @@ with tempfile.TemporaryDirectory() as wd:
                            {"cmd": ["python3", "bad.py"],
                             "timeout": 30})["passed"]
 
+# --- R7: sentence counter must see a final sentence ending in a quote ---
+v = L.check_constraints(
+    {"response": 'Der Leuchtturm leuchtete. "Alles ist still."'},
+    {"checks": [{"type": "sentences", "count": 2}]})
+assert v["passed"], v
+# a decimal point (23.30) must NOT count as a sentence end
+v = L.check_constraints(
+    {"response": "Es war 23.30 Uhr."},
+    {"checks": [{"type": "sentences", "count": 1}]})
+assert v["passed"], v
+
+# --- R8: trailing punctuation tolerance in answer checks ---
+assert L.check_answer({"response": "ANSWER: B."},
+                       {"value": "B", "compact": True})["passed"]
+assert L.check_answer({"response": "ANSWER: A1B2, C3D4, E5F6."},
+                       {"value": "A1B2, C3D4, E5F6", "compact": True})["passed"]
+assert not L.check_answer({"response": "ANSWER: A"},
+                           {"value": "B", "compact": True})["passed"]
+
+# --- R10: script constraint (response must be in the target script) ---
+hi5 = "नमस्ते दुनिया में आपका स्वागत"
+en5 = "hello world from devanagari land"
+v = L.check_constraints({"response": hi5},
+                        {"checks": [{"type": "script",
+                                     "char_class": "[\\u0900-\\u097F]",
+                                     "min_pct": 0.5}]})
+assert v["passed"], v
+v = L.check_constraints({"response": en5},
+                        {"checks": [{"type": "script",
+                                     "char_class": "[\\u0900-\\u097F]",
+                                     "min_pct": 0.5}]})
+assert not v["passed"], v
+assert any(c["type"] == "script" for c in
+           L.SUITES["mullang"][7]["verify"]["checks"]) or \
+       any(c.get("type") == "script" for c in
+           {t["id"]: t for t in L.SUITES["mullang"]}["mullang/hi-words"]
+           ["verify"]["checks"])
+
+# --- R9: task filter implies its suite (longctx reachable without --suites) ---
+import llmbench as _L
+cfg = _L.RunConfig(backend="api", model="qwen3.8",
+                   endpoint="http://127.0.0.1:8000/v1", api_key="k",
+                   suites=[], tasks=["longctx/needle-8k"], repeat=1,
+                   max_tokens=4096, temperature=0.0, timeout=600,
+                   sample_interval=2.0, retries=1, concurrency=1,
+                   warmup=False, npu_container=None,
+                   dsh_api_key_env="X", codex_provider="vllm")
+ids = [t["id"] for t in _L.selected_tasks(cfg)[0]]
+assert "longctx/needle-8k" in ids, ids
+cfg2 = _L.RunConfig(backend="api", model="qwen3.8",
+                    endpoint="http://127.0.0.1:8000/v1", api_key="k",
+                    suites=[], tasks=[], repeat=1, max_tokens=4096,
+                    temperature=0.0, timeout=600, sample_interval=2.0,
+                    retries=1, concurrency=1, warmup=False, npu_container=None,
+                    dsh_api_key_env="X", codex_provider="vllm")
+all_ids = {t["id"] for t in _L.selected_tasks(cfg2)[0]}
+assert not any(i.startswith("longctx/") for i in all_ids)
+
 # --- mullang: ground truths ---
 ml = {t["id"]: t for t in L.SUITES["mullang"]}
 assert len(ml) == 8

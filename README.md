@@ -107,7 +107,7 @@ opt-in `longctx` suite**, which you must name explicitly).
 | `coding` | 8 | original unit-tested problems (anagram, roman, intervals, moving avg, parens, flatten, caesar, top-k) | solution read from `scratch/solution.py` if the agent wrote one, else extracted from the first ` ```python ` block; unittest suite run (60 s timeout) |
 | `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
 | `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude) |
-| `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count (hi) | existing verifiers (math / gridpath / constraints / answer) — language-neutral |
+| `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count in Devanagari (hi, `script` check) | existing verifiers (math / gridpath / constraints / answer) + script check |
 | `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — 8k, 32k (3 needles, order), 128k tokens | `ANSWER:` exact/ordered (api backend only; a 128k-token prompt exceeds the CLI per-argument length limit) |
 
 `python3 selftest.py` runs fast offline verifier self-tests.

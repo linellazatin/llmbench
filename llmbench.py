@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fcntl
 import http.client
 import json
 import math
@@ -37,6 +38,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -544,6 +546,12 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", str(s)).lower()
 
 
+def _strip_end_punct(s: str) -> str:
+    """Trailing sentence punctuation only ('B.' -> 'B', '11:55.' -> '11:55').
+    Applied to both sides of a comparison so it can't collide distinct values."""
+    return s.rstrip(".,;:!?'\")").strip()
+
+
 def check_answer(ctx: dict, spec: dict) -> dict:
     """ANSWER: contract with optional numeric equivalence."""
     got = extract_answer(ctx["response"])
@@ -558,9 +566,9 @@ def check_answer(ctx: dict, spec: dict) -> dict:
         else:
             ok = math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-9)
     elif spec.get("compact"):
-        ok = _norm(got) == _norm(str(want))
+        ok = _norm(_strip_end_punct(got)) == _norm(_strip_end_punct(str(want)))
     else:
-        ok = got.lower() == str(want).lower()
+        ok = (_strip_end_punct(got).lower() == _strip_end_punct(str(want)).lower())
     return {"passed": ok, "expected": want, "actual": got[:200]}
 
 
@@ -593,7 +601,10 @@ def safe_eval(expr: str):
 
 # --- instruction-following constraints --------------------------------------
 
-SENT_RE = re.compile(r"[.!?]+(?:\s|$)")
+# a sentence ends at terminal punctuation followed by whitespace, a closing
+# quote/bracket (…Licht." — the quote would otherwise hide the final period),
+# or end-of-text
+SENT_RE = re.compile(r"[.!?]+(?:\s|['\")\]]|$)")
 
 
 def _word_re(w: str) -> re.Pattern:
@@ -676,6 +687,18 @@ def check_constraints(ctx: dict, spec: dict) -> dict:
                 checks.append({"check": "json_shape", "passed": not bad,
                                "detail": bad or None,
                                "actual": json.dumps(obj)[:200]})
+        elif t == "script":
+            # response must actually be written in the given script:
+            # fraction of alphabetic chars inside `char_class` >= min_pct
+            pat = re.compile(c.get("char_class", r"\w"))
+            alpha = [ch for ch in text if ch.isalpha()]
+            pct = (sum(1 for ch in alpha if pat.fullmatch(ch))
+                   / len(alpha)) if alpha else 0.0
+            min_pct = c.get("min_pct", 0.5)
+            checks.append({"check": f"script>= {min_pct:.0%}", "passed":
+                            bool(alpha) and pct >= min_pct,
+                            "actual_pct": round(pct, 3),
+                            "alpha_chars": len(alpha)})
         elif t == "case":
             alpha = [ch for ch in text if ch.isalpha()]
             if c["mode"] == "upper":
@@ -994,6 +1017,7 @@ class ApiBackend:
 
         res = ChatResult()
         t0 = time.monotonic()
+        done = False  # stream completed with [DONE]
         try:
             conn.request("POST", req_path, body=req_body, headers=headers)
             resp = conn.getresponse()
@@ -1017,6 +1041,7 @@ class ApiBackend:
                         continue
                     payload = line[5:].strip()
                     if payload == "[DONE]":
+                        done = True
                         break
                     try:
                         ev = json.loads(payload)
@@ -1063,8 +1088,14 @@ class ApiBackend:
                     args = {"_raw": d["args"]}
                 res.tool_calls.append({"id": d["id"], "name": d["name"], "args": args})
         except Exception as e:  # noqa: BLE001
-            if not res.text and not res.tool_calls:
+            if done:
+                pass  # stream completed; a late local failure is harmless
+            elif not res.text and not res.tool_calls:
                 res.error = f"{type(e).__name__}: {e}"
+            else:
+                # partial text arrived but the stream never finished — a
+                # transport interruption, not a model verdict (so it retries)
+                res.error = f"stream interrupted ({type(e).__name__}: {e})"
         finally:
             conn.close()
             res.total_s = time.monotonic() - t0
@@ -1174,18 +1205,39 @@ class CliBackend:
         deadline = t0 + cfg.timeout
 
         q: "queue.Queue" = queue.Queue()
+        err_chunks: list[bytes] = []
 
         def reader() -> None:
             assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read1(4096)
-                if not chunk:
-                    break
-                q.put(chunk)
-            q.put(None)
+            try:
+                while True:
+                    chunk = proc.stdout.read1(4096)
+                    if not chunk:
+                        break
+                    q.put(chunk)
+            finally:
+                # sentinel even on a read error — without it the drain loop
+                # would spin until the deadline on a dead pipe
+                q.put(None)
+
+        def err_drain() -> None:
+            # drain stderr concurrently: a verbose CLI writing >64 KiB to
+            # stderr would otherwise deadlock on the full pipe buffer
+            assert proc.stderr is not None
+            try:
+                while True:
+                    chunk = proc.stderr.read1(65536)
+                    if not chunk:
+                        break
+                    if len(b"".join(err_chunks)) < 8192:
+                        err_chunks.append(chunk)
+            except (OSError, ValueError):
+                pass
 
         th = threading.Thread(target=reader, daemon=True)
         th.start()
+        eth = threading.Thread(target=err_drain, daemon=True)
+        eth.start()
         buf = b""
         closed = False
         while not closed:
@@ -1210,14 +1262,19 @@ class CliBackend:
                 if not outcome.error:
                     outcome.error = f"timeout after {cfg.timeout:.0f}s"
                 break
-        if buf.strip() and not closed:
+        if buf.strip():
+            # a final event without a trailing newline must not be dropped
             self.parse_line(outcome, buf.decode(errors="replace").rstrip("\r"))
         th.join(timeout=5)
+        eth.join(timeout=5)
         outcome.exit_code = proc.poll()
-        try:
-            outcome.stderr_tail = proc.stderr.read().decode(errors="replace")[-1200:]
-        except Exception:  # noqa: BLE001
-            pass
+        if outcome.exit_code is None:  # not yet reaped (rare after pipe EOF)
+            try:
+                outcome.exit_code = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._kill(proc)
+                outcome.exit_code = proc.wait()
+        outcome.stderr_tail = b"".join(err_chunks)[-1200:].decode(errors="replace")
         outcome.total_s = time.monotonic() - t0
         if outcome.ttft_model_s is not None:  # parse_line stored a monotonic clock value
             outcome.ttft_model_s = round(outcome.ttft_model_s - t0, 3)
@@ -1363,6 +1420,29 @@ class CodexBackend(CliBackend):
                 outcome.error = "no agent_message received"
 
 
+@contextmanager
+def _claude_trust_lock():
+    """Serialize read-modify-write cycles on ~/.claude.json. Two claude tasks
+    running concurrently (e.g. --concurrency > 1) must not interleave their
+    trust-entry edits and lose one another's (or the user's) state."""
+    lf = open(os.path.expanduser("~/.claude.json.lock"), "a")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
+
+def _claude_trust_write(data: dict, trust: str) -> None:
+    """Atomic replace with a unique temp name (a fixed name would let a
+    crashed writer's leftover be misattributed by a later replace)."""
+    tmp = f"{trust}.llmbench.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, trust)
+
+
 def _claude_prepare(scratch: str) -> None:
     """Make a scratch dir usable for non-interactive agentic claude runs:
     1. project-level allowlist (<scratch>/.claude/settings.json)
@@ -1375,19 +1455,17 @@ def _claude_prepare(scratch: str) -> None:
         json.dump({"permissions": {"allow": ["Bash", "Read", "Write", "Edit"]}},
                   f, indent=1)
     trust = os.path.expanduser("~/.claude.json")
-    data = {}
-    if os.path.isfile(trust):
-        try:
-            with open(trust) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            data = {}
-    entry = data.setdefault("projects", {}).setdefault(scratch, {})
-    entry["hasTrustDialogAccepted"] = True
-    tmp = trust + ".llmbench.tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, trust)
+    with _claude_trust_lock():
+        data = {}
+        if os.path.isfile(trust):
+            try:
+                with open(trust) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        entry = data.setdefault("projects", {}).setdefault(scratch, {})
+        entry["hasTrustDialogAccepted"] = True
+        _claude_trust_write(data, trust)
 
 
 class ClaudeBackend(CliBackend):
@@ -1456,21 +1534,16 @@ class ClaudeBackend(CliBackend):
         trust = os.path.expanduser("~/.claude.json")
         if not os.path.isfile(trust):
             return
-        try:
-            with open(trust) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return
-        if (data.get("projects") or {}).pop(scratch, None) is None:
-            return
-        tmp = trust + ".llmbench.tmp"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, trust)
-        except OSError:
+        with _claude_trust_lock():
             try:
-                os.unlink(tmp)
+                with open(trust) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                return
+            if (data.get("projects") or {}).pop(scratch, None) is None:
+                return
+            try:
+                _claude_trust_write(data, trust)
             except OSError:
                 pass
 
@@ -2152,7 +2225,11 @@ MULLANG_TASKS: list[dict] = [
     task("mullang/hi-words",
          "अपने जवाब में ठीक 5 शब्द लिखें। जवाब हिंदी में हो। कोई अन्य वाक्य, "
          "पंक्ति या संकेत न लिखें।",
-         {"type": "constraints", "checks": [{"type": "words", "min": 5, "max": 5}]}),
+         {"type": "constraints", "checks": [
+             {"type": "words", "min": 5, "max": 5},
+             # the answer must actually be in Devanagari, not English
+             {"type": "script", "char_class": "[\\u0900-\\u097F]",
+              "min_pct": 0.5}]}),
 ]
 
 # --- longctx (opt-in — excluded from default runs; api backend only) --------
@@ -2275,6 +2352,10 @@ def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int]:
     skipped = 0
     if cfg.suites:
         active = set(cfg.suites)
+    elif cfg.tasks:
+        # an explicit task filter IS an explicit selection — the heavy-suite
+        # exclusion applies only to default (unfiltered) runs
+        active = set(SUITES)
     else:
         active = set(SUITES) - DEFAULT_EXCLUDE
     for suite_name, tasks_ in SUITES.items():
@@ -2489,15 +2570,21 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
 
     # verdict
     if not result.error and (result.text or result.tool_calls):
-        verifier = VERIFIERS.get(t["verify"]["type"])
-        if verifier is None:
-            res["verdict"] = {"passed": False, "detail":
-                              f"unknown verifier '{t['verify']['type']}'"}
-        else:
-            ctx = {"response": result.text, "tool_calls": result.tool_calls,
-                   "task_id": rid, "out_dir": out_dir, "scratch": scratch}
-            res["verdict"] = verifier(ctx, t["verify"])
-            res["status"] = "pass" if res["verdict"]["passed"] else "fail"
+        try:
+            verifier = VERIFIERS.get(t["verify"]["type"])
+            if verifier is None:
+                res["verdict"] = {"passed": False, "detail":
+                                  f"unknown verifier '{t['verify']['type']}'"}
+            else:
+                ctx = {"response": result.text, "tool_calls": result.tool_calls,
+                       "task_id": rid, "out_dir": out_dir, "scratch": scratch}
+                res["verdict"] = verifier(ctx, t["verify"])
+                res["status"] = "pass" if res["verdict"]["passed"] else "fail"
+        except Exception as e:  # noqa: BLE001 — a verifier bug is not a model
+            # verdict: record it, retry, and keep the run alive
+            res["status"] = "error"
+            res["error"] = (f"verifier {t['verify']['type']} crashed: "
+                             f"{type(e).__name__}: {e}")
 
     res["resources"] = aggregate_resources(
         sampler.samples,
@@ -2506,36 +2593,41 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     # per-task artifacts
     task_dir = os.path.join(out_dir, "tasks")
     os.makedirs(task_dir, exist_ok=True)
-    with open(os.path.join(task_dir, f"{task_key}.md"), "w") as f:
+    try:
         r3 = lambda v: round(v, 3) if isinstance(v, (int, float)) else v  # noqa: E731
-        f.write(f"# {rid}\n\n- suite: {t['suite']}\n- backend: {cfg.backend}\n"
-                f"- status: {res['status']}\n"
-                f"- ttft: {r3(res['ttft_s'])}s (first reasoning: "
-                f"{r3(res.get('ttft_first_reasoning_s'))}s)  total: {res['total_s']}s\n"
-                f"- gen: {res.get('gen_tps')} tok/s  decode(content): "
-                f"{res.get('decode_tps')} tok/s  overall: {res.get('overall_tps')} tok/s\n"
-                f"- tokens ({res['token_source']}): prompt {res.get('prompt_tokens')} / "
-                f"completion {res.get('completion_tokens')} / total "
-                f"{res.get('total_tokens')}\n\n")
-        f.write(f"## Prompt\n\n```\n{t['prompt']}\n```\n\n")
-        if getattr(result, "reasoning", None):
-            f.write(f"## Reasoning\n\n```\n{result.reasoning}\n```\n\n")
-        f.write(f"## Response\n\n```\n{result.text or '(empty)'}\n```\n\n")
-        if result.tool_calls:
-            f.write("## Tool calls\n\n```json\n"
-                     f"{json.dumps(result.tool_calls, indent=2)}\n```\n\n")
-        if result.events:
-            f.write("## CLI events\n\n```json\n"
-                     f"{json.dumps(result.events, indent=2)[:6000]}\n```\n\n")
-        if res.get("verdict"):
-            f.write(f"## Verdict\n\n```json\n{json.dumps(res['verdict'], indent=2)}\n```\n")
-        if result.stderr_tail:
-            f.write(f"## CLI stderr (tail)\n\n```\n{result.stderr_tail}\n```\n")
-        if result.error:
-            f.write(f"\n## Error\n\n```\n{result.error}\n```\n")
-    with open(os.path.join(task_dir, f"{task_key}.samples.jsonl"), "w") as f:
-        for s in sampler.samples:
-            f.write(json.dumps(s) + "\n")
+        with open(os.path.join(task_dir, f"{task_key}.md"), "w") as f:
+            f.write(f"# {rid}\n\n- suite: {t['suite']}\n- backend: {cfg.backend}\n"
+                    f"- status: {res['status']}\n"
+                    f"- ttft: {r3(res['ttft_s'])}s (first reasoning: "
+                    f"{r3(res.get('ttft_first_reasoning_s'))}s)  total: {res['total_s']}s\n"
+                    f"- gen: {res.get('gen_tps')} tok/s  decode(content): "
+                    f"{res.get('decode_tps')} tok/s  overall: {res.get('overall_tps')} tok/s\n"
+                    f"- tokens ({res['token_source']}): prompt {res.get('prompt_tokens')} / "
+                    f"completion {res.get('completion_tokens')} / total "
+                    f"{res.get('total_tokens')}\n\n")
+            f.write(f"## Prompt\n\n```\n{t['prompt']}\n```\n\n")
+            if getattr(result, "reasoning", None):
+                f.write(f"## Reasoning\n\n```\n{result.reasoning}\n```\n\n")
+            f.write(f"## Response\n\n```\n{result.text or '(empty)'}\n```\n\n")
+            if result.tool_calls:
+                f.write("## Tool calls\n\n```json\n"
+                         f"{json.dumps(result.tool_calls, indent=2)}\n```\n\n")
+            if result.events:
+                f.write("## CLI events\n\n```json\n"
+                         f"{json.dumps(result.events, indent=2)[:6000]}\n```\n\n")
+            if res.get("verdict"):
+                f.write(f"## Verdict\n\n```json\n{json.dumps(res['verdict'], indent=2)}\n```\n")
+            if result.stderr_tail:
+                f.write(f"## CLI stderr (tail)\n\n```\n{result.stderr_tail}\n```\n")
+            if result.error:
+                f.write(f"\n## Error\n\n```\n{result.error}\n```\n")
+        with open(os.path.join(task_dir, f"{task_key}.samples.jsonl"), "w") as f:
+            for s in sampler.samples:
+                f.write(json.dumps(s) + "\n")
+    except OSError as e:
+        # evidence store failed (disk full / not writable) — the verdict
+        # stands, but flag the missing artifacts
+        res["artifact_error"] = f"{type(e).__name__}: {e}"
     return res
 
 
@@ -2783,7 +2875,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--model", default=os.environ.get("LLMBENCH_MODEL", "qwen3.8"))
     pr.add_argument("--api-key", default=os.environ.get("LLMBENCH_API_KEY", "llmbench"))
     pr.add_argument("--suites", default="",
-                    help="comma-separated suite names (default: all)")
+                    help="comma-separated suite names (default: all except "
+                         "longctx, which is opt-in)")
     pr.add_argument("--tasks", default="", help="comma-separated task ids (default: all)")
     pr.add_argument("--repeat", type=int, default=1)
     pr.add_argument("--max-tokens", type=int, default=4096)
@@ -2839,8 +2932,11 @@ def cmd_list(_: argparse.Namespace) -> None:
 def cmd_compare(args: argparse.Namespace) -> None:
     runs = []
     for d in args.run_dirs:
-        with open(os.path.join(d, "run.json")) as f:
-            run = json.load(f)
+        try:
+            with open(os.path.join(d, "run.json")) as f:
+                run = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(f"[llmbench] cannot read {d}/run.json: {e}") from e
         cfg = run["config"]
         label = f"{cfg['backend']}/{cfg['model']}"
         runs.append((label, run))
@@ -2912,8 +3008,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
 
 def cmd_report(args: argparse.Namespace) -> None:
     path = os.path.join(args.run_dir, "run.json")
-    with open(path) as f:
-        run = json.load(f)
+    try:
+        with open(path) as f:
+            run = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"[llmbench] cannot read {path}: {e}") from e
     os.makedirs(args.run_dir, exist_ok=True)
     with open(os.path.join(args.run_dir, "report.md"), "w") as f:
         f.write(render_report_md(run))
