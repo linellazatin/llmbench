@@ -160,7 +160,7 @@ for t in L.SUITES["longctx"]:
         assert codes == exp.split(", "), (t["id"], codes, exp)
     else:
         assert codes == [exp], (t["id"], codes, exp)
-assert all(t.get("backends") == ["api"] for t in L.SUITES["longctx"])
+assert all(t.get("backends") == ["api", "pi"] for t in L.SUITES["longctx"])
 assert "longctx" in L.DEFAULT_EXCLUDE
 
 # --- CI helper ---
@@ -277,6 +277,14 @@ with _tmp.TemporaryDirectory() as scratch:
     ]:
         b.parse_line(o8, _json.dumps(e))
     assert o8.reasoning == ""
+    # stdin hook: base backends never feed stdin; pi pipes only >96k prompts
+    # (the per-argument limit), and then argv must not repeat prompt/system
+    assert L.DshBackend(_bcfg("dsh")).stdin_for(BTASK) is None
+    big = {"prompt": "x" * 100_000, "system": "sys"}
+    cmdl, _ = L.PiBackend(_bcfg("pi")).build(big, scratch)
+    assert "--" not in cmdl and "--append-system-prompt" not in cmdl, cmdl
+    assert L.PiBackend(_bcfg("pi")).stdin_for(big) is not None
+    assert L.PiBackend(_bcfg("pi")).stdin_for(BTASK_SYS) is None
 
     o = L.TaskOutcome()
     evs = [

@@ -1172,6 +1172,11 @@ class CliBackend:
     def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
         raise NotImplementedError
 
+    def stdin_for(self, t: dict) -> "str | None":
+        """Text to feed the child's stdin (None = /dev/null). Override when
+        the prompt cannot fit an argv argument (per-argument length limit)."""
+        return None
+
     def parse_line(self, outcome: TaskOutcome, line: str) -> None:  # noqa: B027
         pass
 
@@ -1197,8 +1202,11 @@ class CliBackend:
         cfg = self.cfg
         cmd, env = self.build(t, scratch)
         outcome = TaskOutcome()
+        stdin_text = self.stdin_for(t)
         proc = subprocess.Popen(
-            cmd, cwd=scratch, env=env, stdin=subprocess.DEVNULL,
+            cmd, cwd=scratch, env=env,
+            stdin=subprocess.PIPE if stdin_text is not None
+            else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         set_root(proc.pid)
         t0 = time.monotonic()
@@ -1238,6 +1246,15 @@ class CliBackend:
         th.start()
         eth = threading.Thread(target=err_drain, daemon=True)
         eth.start()
+        if stdin_text is not None:
+            # after the reader threads are up: the child consumes at startup
+            # while its stdout sits in the kernel pipe buffer
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(stdin_text.encode())
+                proc.stdin.close()
+            except OSError as e:
+                outcome.error = f"stdin feed failed: {e}"
         buf = b""
         closed = False
         while not closed:
@@ -1587,16 +1604,26 @@ class PiBackend(CliBackend):
         cmd = ["pi", "--mode", "json", "--no-session",
                "--provider", "llmbench", "--model", cfg.model,
                "--api-key", cfg.api_key]
-        if t.get("system"):
+        via_stdin = self.stdin_for(t) is not None
+        if t.get("system") and not via_stdin:
             cmd += ["--append-system-prompt", t["system"]]
         if cfg.pi_tools:
             cmd += ["--tools", cfg.pi_tools]
         if cfg.pi_thinking:
             cmd += ["--thinking", cfg.pi_thinking]
-        cmd += ["--", t["prompt"]]
+        if not via_stdin:
+            cmd += ["--", t["prompt"]]
         env = dict(os.environ)
         env["PI_CODING_AGENT_DIR"] = agent_dir
         return cmd, env
+
+    def stdin_for(self, t: dict) -> "str | None":
+        # the Linux per-argument limit (131072 bytes) bounds argv prompts;
+        # pi prepends piped stdin to the first prompt (cli.md). The 96k
+        # threshold leaves headroom under the limit for the system prompt
+        # and task contract; the system prompt rides inside the stdin text.
+        prompt = self.full_prompt(t)
+        return prompt if len(prompt) > 96_000 else None
 
     def parse_line(self, outcome: TaskOutcome, line: str) -> None:
         line = line.strip()
@@ -2385,7 +2412,7 @@ MULLANG_TASKS: list[dict] = [
               "min_pct": 0.5}]}),
 ]
 
-# --- longctx (opt-in — excluded from default runs; api backend only) --------
+# --- longctx (opt-in — excluded from default runs; api + pi, stdin for >96k) ---
 # CLI backends take the prompt as a process argument (Linux MAX_ARG_STRLEN is
 # 128 KiB per argument), so 128k-token prompts cannot be delivered that way.
 
@@ -2463,9 +2490,10 @@ SUITES: dict[str, list[dict]] = {
 # the tools suite (OpenAI `tools` parameter) only makes sense on the api backend
 for _t in TOOLS_TASKS:
     _t.setdefault("backends", ["api"])
-# longctx prompts exceed the CLI per-argument length limit (see above)
+# longctx: prompts beyond the CLI per-argument limit ride pi's stdin
+# (PiBackend.stdin_for); other CLI backends stay argv-bound
 for _t in LONGCTX_TASKS:
-    _t.setdefault("backends", ["api"])
+    _t.setdefault("backends", ["api", "pi"])
 # heavy prompts: not part of a default run
 DEFAULT_EXCLUDE = {"longctx"}
 
