@@ -114,6 +114,32 @@ per-task backend gates.
 | `report` | `python3 llmbench.py report <run_dir>` | re-render `report.md` from an existing `run.json` |
 | `compare` | `python3 llmbench.py compare <run_dir>... [--save FILE.md]` | side-by-side table (also printed); `--save` writes the file |
 
+### Usage proxy — measuring true token cost for any backend
+
+For CLIs that don't report usage (notably `dsh`), or to audit server-side usage of any backend, run a loopback usage-logging proxy between the harness and the engine:
+
+```bash
+# 1. start the proxy (forwards to 127.0.0.1:8000, appends one JSON record per request)
+python3 tools/usage_proxy.py --port 8001 --log results/proxy-usage.jsonl &
+
+# 2. run llmbench as usual, pointing the endpoint at the proxy
+python3 llmbench.py run --backend dsh --endpoint http://127.0.0.1:8001/v1
+
+# 3. dsh only: correlate the captured calls to tasks (prints per-task/suite totals,
+#    writes <run_dir>/../dsh-proxy/measured.json)
+python3 tools/dsh_usage_corr.py results/<run_dir> results/proxy-usage.jsonl
+```
+
+| item | value |
+|---|---|
+| what it does | transparent forwarder to `--upstream-host --upstream-port` (default `127.0.0.1:8000`); model names, auth, bodies and streaming pass through unchanged |
+| usage capture | non-streaming: `usage` from the response body (included by default); streaming: injects `stream_options.include_usage` and captures the engine's final usage chunk — the client's stream is otherwise untouched |
+| log records | one JSON line per request: epoch time, path, status, model, stream flag, prompt/completion/total tokens, and the last user message (`user_full` + head/tail) as a fingerprint for task correlation |
+| overhead | loopback, per-connection; task latency in the measured dsh runs was indistinguishable from the direct runs |
+| note | keep a single client per log — `dsh_usage_corr.py` attributes calls to tasks by prompt fingerprint + temporal order, which assumes the harness is the only caller. For other backends the raw JSONL is enough: records are time-ordered, one per internal API call |
+
+Reference run: dsh through the proxy on 2026-10-14 (`results/20261014-160020_qwen3.8_dsh`) — 129 captured calls, 778.6k measured total tokens vs the harness's 8.6k visible-text estimate (see the dsh table above).
+
 ### api — reference backend
 
 No CLI binary needed; streams `/chat/completions` directly.
@@ -154,7 +180,7 @@ python3 llmbench.py run --backend dsh --dsh-api-key-env MY_OTHER_KEY_ENV --suite
 | backend-specific flags | `--dsh-api-key-env <NAME>` — name of the env var dsh's per-run provider reads the key from; any non-empty string (default `MY_GATEWAY_API_KEY`) |
 | suites | 7 (all except `tools` [api-only] and `longctx` [argv size limit]) = 48 tasks |
 | shared flags effective | `--max-tokens` ✗, `--temperature` ✗ (no knobs wired for this CLI) |
-| tokens / latency | **estimated** (~4 chars/token of the prompt only, `token_source=estimate`) — dsh prints no usage; fully buffered, so `ttft_model_s` = final message (TTFT ≈ total) |
+| tokens / latency | **estimated** (~4 chars/token of the prompt only, `token_source=estimate`) — dsh prints no usage; stdout-buffered (it *does* stream over the wire — SSE incl. thinking — but prints only the final message), so `ttft_model_s` = final message (TTFT ≈ total). True usage is measurable through the loopback usage-logging proxy `tools/usage_proxy.py` (+ `tools/dsh_usage_corr.py` for request→task correlation): measured 2026-10-14, run `results/20261014-160020_qwen3.8_dsh`, dsh's real cost is 778.6k total tokens / 48 tasks (~15.7k prompt/task — a ~170-token session-title call + ≥1 agent call with ~8.9k of dsh scaffolding each) |
 
 ### codex
 
@@ -320,6 +346,7 @@ streaming parser (no model, no network).
   11.6 / dsh 11.8 / codex 16.9 s) and the most token-efficient (279k prompt
   tokens vs codex 593k / claude 1.16M; dsh 2.9k estimated) — see
   `results/pi-compare.md`.
+- **dsh true-cost measurement (2026-10-14, run `20261014-160020_qwen3.8_dsh`):** loopback usage-logging proxy (`tools/usage_proxy.py`, injects `stream_options.include_usage`) captured 129 dsh internal calls — **752.9k prompt / 25.7k completion tokens over 48 tasks** (~15.7k prompt/task: a ~170-token session-title call echoing the task prompt + ≥1 agent call carrying ~8.9k of dsh scaffolding). The harness's visible-text estimate (8.6k) understated it ~91×. Verdicts identical to the raw run (47/48; `ifeval/first-line-number` miss reproduced in all three dsh runs at temperature 0).
 - The DSH file sandbox denies writes to `~/.dsh` and `~/.codex/tmp`; the CLI
   backends therefore need a one-shot `danger-full-access` escalation in this
   harness (on a normal shell they just run).
