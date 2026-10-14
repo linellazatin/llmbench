@@ -112,7 +112,9 @@ opt-in `longctx` suite**, which you must name explicitly).
 | `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count in Devanagari (hi, `script` check) | existing verifiers (math / gridpath / constraints / answer) + script check |
 | `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — 8k, 32k (3 needles, order), 128k tokens | `ANSWER:` exact/ordered (api + pi; prompts over the CLI per-argument limit ride pi's stdin) |
 
-`python3 selftest.py` runs fast offline verifier self-tests.
+`python3 selftest.py` runs fast offline checks: the verifier self-tests plus
+build/parse characterization probes for every CLI backend (no model, no
+network).
 
 ## Run modes
 

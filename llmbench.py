@@ -1006,10 +1006,14 @@ class ApiBackend:
         if tools:
             body["tools"] = tools
 
-        host, _, path = self.endpoint[7:].partition("/")
-        path = "/" + path  # e.g. "/v1"
-        req_path = path + "/chat/completions"
-        conn = http.client.HTTPConnection(host, timeout=self.timeout)
+        scheme, _, rest = self.endpoint.partition("://")
+        if scheme not in ("http", "https") or not rest:
+            raise ValueError(f"endpoint must be an http(s) URL: {self.endpoint!r}")
+        hostport, _, path = rest.partition("/")
+        conn_cls = (http.client.HTTPSConnection if scheme == "https"
+                    else http.client.HTTPConnection)
+        conn = conn_cls(hostport, timeout=self.timeout)
+        req_path = "/" + path + "/chat/completions"  # path e.g. "v1"
         req_body = json.dumps(body).encode()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -1183,7 +1187,8 @@ class CliBackend:
     def finalize(self, outcome: TaskOutcome) -> None:  # noqa: B027
         if outcome.completion_tokens is None:
             outcome.completion_tokens = _est_tokens(outcome.text)
-            outcome.prompt_tokens = _est_tokens(self._prompt)
+            est_prompt = getattr(outcome, "_est_prompt", self._prompt)
+            outcome.prompt_tokens = _est_tokens(est_prompt)
             outcome.total_tokens = (outcome.prompt_tokens or 0) + \
                                    (outcome.completion_tokens or 0)
             outcome.token_source = "estimate"
@@ -1202,6 +1207,7 @@ class CliBackend:
         cfg = self.cfg
         cmd, env = self.build(t, scratch)
         outcome = TaskOutcome()
+        outcome._est_prompt = self.full_prompt(t)  # per-outcome; self._prompt races under --concurrency > 1
         stdin_text = self.stdin_for(t)
         proc = subprocess.Popen(
             cmd, cwd=scratch, env=env,
@@ -1584,13 +1590,15 @@ class PiBackend(CliBackend):
         agent_dir = os.path.join(scratch, ".pi-agent")
         os.makedirs(agent_dir, exist_ok=True)
         # self-contained: pi reads ONLY this file, so no user-model bleed.
-        # When --pi-thinking is set, declare reasoning + the qwen-chat-template
-        # compat so pi maps the level to the Qwen wire switch
-        # (chat_template_kwargs {enable_thinking: level != "off",
+        # maxTokens mirrors --max-tokens so the output budget matches the api
+        # backend (parity); when --pi-thinking is set, declare reasoning + the
+        # qwen-chat-template compat so pi maps the level to the Qwen wire
+        # switch (chat_template_kwargs {enable_thinking: level != "off",
         # preserve_thinking: true}); default (unset) keeps the wire exactly
         # as before the flag existed.
         model_entry = {"id": cfg.model,
-                       "contextWindow": 262144, "maxTokens": 8192}
+                       "contextWindow": 262144,
+                       "maxTokens": cfg.max_tokens}
         if cfg.pi_thinking:
             model_entry["reasoning"] = True
             model_entry["compat"] = {"thinkingFormat": "qwen-chat-template"}
@@ -2602,6 +2610,7 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             "temperature": cfg.temperature, "timeout_s": cfg.timeout,
             "retries": cfg.retries, "concurrency": cfg.concurrency,
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
+            "dsh_api_key_env": cfg.dsh_api_key_env,
             "codex_provider": cfg.codex_provider,
             "pi_tools": cfg.pi_tools,
             "pi_thinking": cfg.pi_thinking,
@@ -3208,6 +3217,10 @@ def cmd_report(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    if not args.endpoint.startswith(("http://", "https://")):
+        print(f"[llmbench] --endpoint must be an http(s) URL, "
+              f"got {args.endpoint!r}", file=sys.stderr)
+        sys.exit(2)
     cfg = RunConfig(
         backend=args.backend, model=args.model, endpoint=args.endpoint,
         api_key=args.api_key,

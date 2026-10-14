@@ -216,6 +216,11 @@ with _tmp.TemporaryDirectory() as scratch:
     assert p["baseUrl"] == "http://127.0.0.1:8000/v1"
     assert p["api"] == "openai-completions" and p["apiKey"] == "llmbench"
     assert p["models"][0]["id"] == "qwen3.8"
+    # maxTokens mirrors --max-tokens (parity with the api backend)
+    assert p["models"][0]["maxTokens"] == 4096
+    _cmdm, _ = L.PiBackend(_bcfg("pi", max_tokens=8192)).build(BTASK, scratch)
+    assert (_json.load(open(_os.path.join(scratch, ".pi-agent", "models.json")))
+            ["providers"]["llmbench"]["models"][0]["maxTokens"] == 8192)
     # thinking declaration: absent by default (wire unchanged); present when
     # --pi-thinking is set, so pi maps the level to enable_thinking
     assert "reasoning" not in p["models"][0]
@@ -331,6 +336,11 @@ with _tmp.TemporaryDirectory() as scratch:
     o3.text, o3.exit_code, b._prompt = "pong", 0, "Say pong."
     b.finalize(o3)
     assert o3.token_source == "estimate" and o3.prompt_tokens is not None
+    o3b = L.TaskOutcome()  # per-outcome estimate basis (concurrency-safe path)
+    o3b.text, o3b.exit_code = "pong", 0
+    o3b._est_prompt = "x" * 400
+    b.finalize(o3b)
+    assert o3b.prompt_tokens == 100 and o3b.token_source == "estimate"
 
     o4 = L.TaskOutcome()  # nonzero exit, no text
     o4.exit_code, o4.stderr_tail = 3, "boom" * 100
