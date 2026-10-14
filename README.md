@@ -269,6 +269,11 @@ network).
 
 ## Run modes
 
+- **Preflight** — before the first task, every `run` does a best-effort
+  `GET <endpoint>/models`: a dead endpoint or an unlisted model surfaces as
+  one warning line instead of N retried task errors. It never blocks the
+  run (an engine may not implement `/models`, or may serve the model under
+  an alias the list does not show).
 - `--retries N` (default 1) — re-attempt a task that **errors** (transport/
   crash), not one that merely fails its verifier (a fail is a real verdict).
   Each task records its `attempts`; the scratch dir is wiped between attempts so

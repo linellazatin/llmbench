@@ -410,5 +410,44 @@ finally:
     else:
         _os.environ["HOME"] = _old_home
 
+# --- api: _apply_delta (reasoning alias + tool accumulation), _est_if_missing
+# (token-estimate fallback), preflight_report (/models parse) ----------------
+cr = L.ChatResult()
+acc = {}
+L.ApiBackend("http://x/v1", "m")._apply_delta(
+    cr, {"delta": {"reasoning_content": "th "}}, 0.0, acc)
+assert cr.reasoning == "th " and cr.reasoning_chunks == 1
+assert cr.ttft_first_reasoning_s is not None
+crb = L.ChatResult()
+L.ApiBackend("http://x/v1", "m")._apply_delta(
+    crb, {"delta": {"reasoning": "x"}, "finish_reason": "stop"}, 0.0, {})
+assert crb.reasoning == "x" and crb.finish_reason == "stop"
+crt = L.ChatResult()  # tool-call accumulation across deltas
+accd = {}
+L.ApiBackend("http://x/v1", "m")._apply_delta(
+    crt, {"delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "function": {"name": "get_", "arguments": "{\"a\":"}}]}},
+    0.0, accd)
+L.ApiBackend("http://x/v1", "m")._apply_delta(
+    crt, {"delta": {"tool_calls": [
+        {"index": 0, "function": {"name": "weather", "arguments": " 1}"}}]}},
+    0.0, accd)
+assert accd[0] == {"id": "c1", "name": "get_weather", "args": '{"a": 1}'}
+
+cr_est = L.ChatResult()  # no usage -> same ~4 chars/token estimate as CLIs
+assert L.ApiBackend._est_if_missing(cr_est, "x" * 400) == "estimate"
+assert (cr_est.prompt_tokens, cr_est.completion_tokens,
+        cr_est.total_tokens) == (100, 1, 101)
+cr_srv = L.ChatResult()  # usage present -> server; total patched if absent
+cr_srv.prompt_tokens, cr_srv.completion_tokens = 10, 20
+assert L.ApiBackend._est_if_missing(cr_srv, "x") == "server"
+assert cr_srv.total_tokens == 30
+
+assert L.preflight_report('{"data": [{"id": "m1"}]}', "m1") is None
+assert "not in /models list" in L.preflight_report('{"data": [{"id": "m1"}]}', "m2")
+assert "non-OpenAI" in L.preflight_report("not json", "m")
+assert "non-OpenAI" in L.preflight_report('{"data": "nope"}', "m1")
+
+print("api parser probes OK")
 print("backend characterization probes OK")
 print("verifier self-tests OK")

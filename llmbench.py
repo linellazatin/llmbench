@@ -1053,31 +1053,7 @@ class ApiBackend:
                         continue
                     choices = ev.get("choices") or []
                     if choices:
-                        delta = choices[0].get("delta") or {}
-                        rc = delta.get("reasoning")
-                        if rc:
-                            if res.ttft_first_reasoning_s is None:
-                                res.ttft_first_reasoning_s = time.monotonic() - t0
-                            res.reasoning += rc
-                            res.reasoning_chunks += 1
-                        c = delta.get("content")
-                        if c:
-                            if res.ttft_first_content_s is None:
-                                res.ttft_first_content_s = time.monotonic() - t0
-                            res.text += c
-                            res.content_chunks += 1
-                        for tcall in delta.get("tool_calls") or []:
-                            idx = tcall.get("index", 0)
-                            d = tc_acc.setdefault(idx, {"id": None, "name": "", "args": ""})
-                            if tcall.get("id"):
-                                d["id"] = tcall["id"]
-                            fn = tcall.get("function") or {}
-                            if fn.get("name"):
-                                d["name"] += fn["name"]
-                            if fn.get("arguments") is not None:
-                                d["args"] += fn["arguments"]
-                        if choices[0].get("finish_reason"):
-                            res.finish_reason = choices[0]["finish_reason"]
+                        self._apply_delta(res, choices[0], t0, tc_acc)
                     usage = ev.get("usage")
                     if usage:
                         res.prompt_tokens = usage.get("prompt_tokens")
@@ -1107,6 +1083,55 @@ class ApiBackend:
             res.ttft_first_content_s = res.ttft_first_reasoning_s
         return res
 
+    def _apply_delta(self, res: "ChatResult", choice: dict, t0: float,
+                      tc_acc: dict[int, dict]) -> None:
+        """One streaming delta -> outcome fields. `reasoning_content` is the
+        DeepSeek-lineage alias of `reasoning` (vLLM's qwen emits the latter,
+        llama.cpp/Ollama thinking models the former) — capture both so the
+        Reasoning artifact does not silently vanish per engine."""
+        delta = choice.get("delta") or {}
+        rc = delta.get("reasoning") or delta.get("reasoning_content")
+        if rc:
+            if res.ttft_first_reasoning_s is None:
+                res.ttft_first_reasoning_s = time.monotonic() - t0
+            res.reasoning += rc
+            res.reasoning_chunks += 1
+        c = delta.get("content")
+        if c:
+            if res.ttft_first_content_s is None:
+                res.ttft_first_content_s = time.monotonic() - t0
+            res.text += c
+            res.content_chunks += 1
+        for tcall in delta.get("tool_calls") or []:
+            idx = tcall.get("index", 0)
+            d = tc_acc.setdefault(idx, {"id": None, "name": "", "args": ""})
+            if tcall.get("id"):
+                d["id"] = tcall["id"]
+            fn = tcall.get("function") or {}
+            if fn.get("name"):
+                d["name"] += fn["name"]
+            if fn.get("arguments") is not None:
+                d["args"] += fn["arguments"]
+        if choice.get("finish_reason"):
+            res.finish_reason = choice["finish_reason"]
+
+    @staticmethod
+    def _est_if_missing(r: "ChatResult", prompt: str) -> str:
+        """Token source. When the engine reports no usage (no streamed usage
+        chunk) fall back to the same ~4 chars/token estimate as the CLI
+        backends, instead of leaving the token columns null (which totals
+        silently count as 0)."""
+        if r.prompt_tokens is None and r.completion_tokens is None:
+            r.prompt_tokens = _est_tokens(prompt)
+            r.completion_tokens = _est_tokens(r.text)
+            r.total_tokens = (r.prompt_tokens or 0) + \
+                               (r.completion_tokens or 0)
+            return "estimate"
+        if r.total_tokens is None:
+            r.total_tokens = (r.prompt_tokens or 0) + \
+                              (r.completion_tokens or 0)
+        return "server"
+
     def warmup(self) -> None:
         self.chat([{"role": "user", "content": "Reply with the single word: ready"}])
 
@@ -1116,13 +1141,16 @@ class ApiBackend:
         if t.get("system"):
             msgs.append({"role": "system", "content": t["system"]})
         msgs.append({"role": "user", "content": t["prompt"]})
+        prompt_text = (t["system"] + "\n\n" + t["prompt"]) \
+            if t.get("system") else t["prompt"]
         r = self.chat(msgs, tools=t.get("tools"))
+        token_source = self._est_if_missing(r, prompt_text)
         o = TaskOutcome(
             text=r.text, reasoning=r.reasoning, ttft_s=r.ttft_first_content_s,
             ttft_model_s=r.ttft_first_content_s,
             ttft_first_reasoning_s=r.ttft_first_reasoning_s, total_s=r.total_s,
             prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
-            total_tokens=r.total_tokens, token_source="server",
+            total_tokens=r.total_tokens, token_source=token_source,
             finish_reason=r.finish_reason, error=r.error, tool_calls=r.tool_calls,
             content_chunks=r.content_chunks, reasoning_chunks=r.reasoning_chunks)
         return o
@@ -2584,11 +2612,65 @@ def console_line(r: dict) -> str:
     return "  ".join(parts)
 
 
+def preflight_report(body: str, model: str) -> "str | None":
+    """Parse an OpenAI-style /models response; return a warning message or
+    None when the model is listed."""
+    try:
+        ids = [m.get("id") for m in json.loads(body).get("data", [])]
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return "non-OpenAI /models shape (engine may not implement it)"
+    if ids and model not in ids:
+        return f"model '{model}' not in /models list {sorted(ids)}"
+    return None
+
+
+def endpoint_preflight(cfg: "RunConfig",
+                       log: Callable[[str], None] = print) -> None:
+    """Best-effort GET <endpoint>/models before the run: a dead endpoint or
+    unknown model surfaces as ONE warning instead of N retried task errors.
+    Never fails the run — the engine may not implement /models, or may serve
+    the model under an alias the list does not show."""
+    scheme, sep, rest = cfg.endpoint.partition("://")
+    if not sep or scheme not in ("http", "https"):
+        log(f"[llmbench] preflight: endpoint not an http(s) URL "
+            f"({cfg.endpoint!r}); skipping")
+        return
+    hostport, _, path = rest.partition("/")
+    conn_cls = (http.client.HTTPSConnection if scheme == "https"
+                else http.client.HTTPConnection)
+    conn = None
+    try:
+        conn = conn_cls(hostport, timeout=10)
+        conn.request("GET", ("/" + path + "/models") if path else "/models",
+                    headers={"Authorization": f"Bearer {cfg.api_key}"})
+        resp = conn.getresponse()
+        body = resp.read(8192).decode(errors="replace")
+        if resp.status != 200:
+            log(f"[llmbench] preflight: GET /models -> HTTP {resp.status}; "
+                f"is the endpoint up? Continuing.")
+            return
+        warn = preflight_report(body, cfg.model)
+        log("[llmbench] preflight: "
+            + (f"endpoint reachable, but {warn}" if warn
+               else f"endpoint reachable, model '{cfg.model}' listed"))
+    except OSError as e:
+        log(f"[llmbench] preflight: endpoint not reachable "
+            f"({type(e).__name__}: {e}); continuing — the first task will "
+            f"confirm")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
 def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) -> dict:
     prober = NPUProber(cfg.npu_container)
     log(f"[llmbench] accelerator sampler: {prober.backend or 'none'}"
         + (f" (container {prober.container})" if prober.container else ""))
 
+    endpoint_preflight(cfg, log)
     backend = build_backend(cfg)
     tasks, skipped = selected_tasks(cfg)
     if skipped:
