@@ -178,4 +178,160 @@ assert "data.txt" in ag["agentic/data-sum"].get("setup", {})
 assert "tools" in {t["id"].split("/")[0] for t in L.SUITES["tools"]}
 assert all(t.get("backends") == ["api"] for t in L.SUITES["tools"])
 
+# --- backend characterization probes (offline: no model, no network) ---------
+# build() argv/env/overlay snapshots for every CLI backend + pi parse/finalize
+# fixtures. These double as the regression net for the --pi-tools/
+# --pi-thinking dialect args (hardening phases 3-4).
+import json as _json
+import os as _os
+import tempfile as _tmp
+
+
+def _bcfg(backend, **kw):
+    base = dict(backend=backend, model="qwen3.8",
+                endpoint="http://127.0.0.1:8000/v1", api_key="llmbench",
+                suites=[], tasks=[], repeat=1, max_tokens=4096,
+                temperature=0.0, timeout=600.0, sample_interval=2.0,
+                retries=1, concurrency=1, warmup=True, npu_container=None,
+                dsh_api_key_env="MY_GATEWAY_API_KEY", codex_provider="llmbench")
+    base.update(kw)
+    return L.RunConfig(**base)
+
+
+BTASK = L.task("probe/x", "Say pong.", {"type": "exact", "value": "pong"})
+BTASK_SYS = L.task("probe/y", "Say pong.", {"type": "exact", "value": "pong"},
+                   system="You are terse.")
+
+# --- pi: build + parse_line + finalize --------------------------------------
+with _tmp.TemporaryDirectory() as scratch:
+    b = L.PiBackend(_bcfg("pi"))
+    cmd, env = b.build(BTASK_SYS, scratch)
+    assert cmd == ["pi", "--mode", "json", "--no-session", "--provider",
+                   "llmbench", "--model", "qwen3.8", "--api-key", "llmbench",
+                   "--append-system-prompt", "You are terse.", "--",
+                   "Say pong."], cmd
+    assert env["PI_CODING_AGENT_DIR"] == _os.path.join(scratch, ".pi-agent")
+    p = _json.load(open(_os.path.join(scratch, ".pi-agent", "models.json")))
+    p = p["providers"]["llmbench"]
+    assert p["baseUrl"] == "http://127.0.0.1:8000/v1"
+    assert p["api"] == "openai-completions" and p["apiKey"] == "llmbench"
+    assert p["models"][0]["id"] == "qwen3.8"
+    cmd2, _ = b.build(BTASK, scratch)  # no system -> no append-system-prompt
+    assert "--append-system-prompt" not in cmd2 and cmd2[-2:] == ["--", "Say pong."]
+
+    o = L.TaskOutcome()
+    evs = [
+        {"type": "session", "version": 3, "id": "u", "cwd": scratch},
+        {"type": "agent_start"},
+        {"type": "message_start", "message": {"role": "user"}},
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_update",
+         "usage": {"input": 120, "output": 4, "totalTokens": 124},
+         "assistantMessageEvent": {"type": "text_delta", "delta": "pong"}},
+        {"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "stop",
+            "usage": {"input": 120, "output": 4, "totalTokens": 124},
+            "content": [{"type": "text", "text": "pong "}]}},
+        {"type": "turn_end", "message": {"role": "assistant"},
+         "toolResults": [{"toolCallId": "c1", "toolName": "bash",
+                           "isError": False}]},
+        {"type": "agent_end", "messages": [], "willRetry": False},
+        {"type": "agent_settled", "aborted": False},
+        "not json, ignore",
+    ]
+    for e in evs:
+        b.parse_line(o, _json.dumps(e) if not isinstance(e, str) else e)
+    assert o.text == "pong " and o.finish_reason == "stop"
+    assert (o.prompt_tokens, o.completion_tokens) == (120, 4)
+    assert o.token_source == "server" and o.ttft_model_s is not None
+    names = [e["event"] for e in o.events]
+    assert names == ["assistant_message_end", "tool_result", "agent_end",
+                     "agent_settled"], names
+    assert o.events[1]["toolName"] == "bash"
+
+    o2 = L.TaskOutcome()  # multi-turn usage summing
+    for e in [evs[3], evs[4], evs[5],
+              {"type": "message_start", "message": {"role": "assistant"}},
+              {"type": "message_update",
+               "usage": {"input": 340, "output": 20, "totalTokens": 360}},
+              {"type": "message_end", "message": {
+                  "role": "assistant", "stopReason": "stop",
+                  "content": [{"type": "text", "text": "final"}]}}]:
+        b.parse_line(o2, _json.dumps(e))
+    assert (o2.prompt_tokens, o2.completion_tokens) == (460, 24)
+
+    o3 = L.TaskOutcome()  # estimate fallback (no usage reported)
+    o3.text, o3.exit_code, b._prompt = "pong", 0, "Say pong."
+    b.finalize(o3)
+    assert o3.token_source == "estimate" and o3.prompt_tokens is not None
+
+    o4 = L.TaskOutcome()  # nonzero exit, no text
+    o4.exit_code, o4.stderr_tail = 3, "boom" * 100
+    b.finalize(o4)
+    assert o4.error and o4.error.startswith("pi exit 3:"), o4.error
+    o5 = L.TaskOutcome()  # zero exit, no assistant message
+    o5.exit_code = 0
+    b.finalize(o5)
+    assert o5.error == "no assistant message received", o5.error
+
+# --- dsh: build (patch overlay + argv/env) ---------------------------------
+with _tmp.TemporaryDirectory() as scratch:
+    b = L.DshBackend(_bcfg("dsh"))
+    cmd, env = b.build(BTASK_SYS, scratch)
+    assert cmd[:4] == ["dsh", "--profile", "headless", "--patch"], cmd[:4]
+    patch = cmd[4]
+    assert _os.path.dirname(patch) == scratch
+    assert cmd[5] == "You are terse.\n\nSay pong."  # system concatenated
+    ytxt = open(patch).read()
+    for frag in ("baseURL: http://127.0.0.1:8000/v1", "api: openai-completions",
+                 "apiKeyEnv: MY_GATEWAY_API_KEY", "id: qwen3.8",
+                 "provider: llmbench"):
+        assert frag in ytxt, frag
+    assert env["MY_GATEWAY_API_KEY"] == "llmbench"
+
+# --- codex: build (exec flags + provider overrides) --------------------------
+with _tmp.TemporaryDirectory() as scratch:
+    b = L.CodexBackend(_bcfg("codex"))
+    cmd, env = b.build(BTASK_SYS, scratch)
+    assert cmd[:6] == ["codex", "exec", "--json", "--skip-git-repo-check",
+                       "--ephemeral", "-C"], cmd[:6]
+    assert cmd[6] == scratch and cmd[7:9] == ["-m", "qwen3.8"]
+    assert cmd[9:11] == ["-c", 'model_provider="llmbench"']
+    assert cmd[11:13] == ["-c", 'model_providers.llmbench.base_url="http://127.0.0.1:8000/v1"']
+    assert cmd[13:15] == ["-c", 'model_providers.llmbench.name="llmbench"']
+    assert cmd[15] == "--dangerously-bypass-approvals-and-sandbox"
+    assert cmd[16] == "You are terse.\n\nSay pong."  # system concatenated
+    assert env["OPENAI_API_KEY"] == "llmbench"
+
+# --- claude: build + after_run (hermetic HOME; real ~/.claude.json untouched)
+_old_home = _os.environ.get("HOME")
+try:
+    with _tmp.TemporaryDirectory() as fakehome, \
+            _tmp.TemporaryDirectory() as scratch:
+        _os.environ["HOME"] = fakehome
+        b = L.ClaudeBackend(_bcfg("claude"))
+        cmd, env = b.build(BTASK_SYS, scratch)
+        assert cmd[:7] == ["claude", "-p", "--output-format", "stream-json",
+                           "--verbose", "--model", "qwen3.8"], cmd[:7]
+        assert cmd[7] == "--no-session-persistence"
+        assert cmd[8] == "Say pong."  # prompt; no-system variant below
+        assert cmd[9:11] == ["--append-system-prompt", "You are terse."]
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "llmbench"
+        assert _json.load(open(_os.path.join(scratch, ".claude", "settings.json"))) \
+            ["permissions"]["allow"] == ["Bash", "Read", "Write", "Edit"]
+        trust = _os.path.join(fakehome, ".claude.json")
+        assert _json.load(open(trust))["projects"][scratch] \
+            ["hasTrustDialogAccepted"] is True
+        b.after_run(scratch)  # trust entry removed again
+        assert scratch not in _json.load(open(trust)).get("projects", {})
+        cmd2, _ = L.ClaudeBackend(_bcfg("claude")).build(BTASK, scratch)
+        assert "--append-system-prompt" not in cmd2
+finally:
+    if _old_home is None:
+        _os.environ.pop("HOME", None)
+    else:
+        _os.environ["HOME"] = _old_home
+
+print("backend characterization probes OK")
 print("verifier self-tests OK")
