@@ -216,8 +216,13 @@ with _tmp.TemporaryDirectory() as scratch:
     assert p["baseUrl"] == "http://127.0.0.1:8000/v1"
     assert p["api"] == "openai-completions" and p["apiKey"] == "llmbench"
     assert p["models"][0]["id"] == "qwen3.8"
+    assert "--tools" not in cmd  # default: no pinning
     cmd2, _ = b.build(BTASK, scratch)  # no system -> no append-system-prompt
     assert "--append-system-prompt" not in cmd2 and cmd2[-2:] == ["--", "Say pong."]
+    # --pi-tools pinning: verbatim, placed before the -- prompt separator
+    cmdt, _ = L.PiBackend(_bcfg("pi", pi_tools="read,bash")).build(BTASK_SYS, scratch)
+    assert cmdt[-6:] == ["--append-system-prompt", "You are terse.",
+                         "--tools", "read,bash", "--", "Say pong."], cmdt[-6:]
 
     o = L.TaskOutcome()
     evs = [

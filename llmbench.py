@@ -1580,6 +1580,8 @@ class PiBackend(CliBackend):
                "--api-key", cfg.api_key]
         if t.get("system"):
             cmd += ["--append-system-prompt", t["system"]]
+        if cfg.pi_tools:
+            cmd += ["--tools", cfg.pi_tools]
         cmd += ["--", t["prompt"]]
         env = dict(os.environ)
         env["PI_CODING_AGENT_DIR"] = agent_dir
@@ -1667,7 +1669,10 @@ BACKEND_REGISTRY: dict[str, BackendSpec] = {
         ("--codex-provider", os.environ.get("LLMBENCH_CODEX_PROVIDER", "vllm"),
          "codex model_providers entry name (default: vllm)"),)),
     "claude": BackendSpec(factory=lambda cfg: ClaudeBackend(cfg)),
-    "pi": BackendSpec(factory=lambda cfg: PiBackend(cfg)),
+    "pi": BackendSpec(factory=lambda cfg: PiBackend(cfg), flags=(
+        ("--pi-tools", "",
+         "pin pi's toolset to this comma-separated allowlist "
+         "(default: pi's full default toolset)"),)),
 }
 BACKENDS = list(BACKEND_REGISTRY)  # all known backends
 
@@ -2458,6 +2463,7 @@ class RunConfig:
     npu_container: Optional[str]
     dsh_api_key_env: str
     codex_provider: str
+    pi_tools: str = ""  # --pi-tools pin; "" = pi's default toolset
 
     @property
     def out_id(self) -> str:
@@ -2538,6 +2544,7 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             "retries": cfg.retries, "concurrency": cfg.concurrency,
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
             "codex_provider": cfg.codex_provider,
+            "pi_tools": cfg.pi_tools,
         },
         "host": host_facts(),
         "metrics_legend": {
@@ -3153,6 +3160,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         warmup=args.warmup, npu_container=args.npu_container,
         dsh_api_key_env=args.dsh_api_key_env,
         codex_provider=args.codex_provider,
+        pi_tools=args.pi_tools,
     )
     out_dir = os.path.join(args.out, cfg.out_id)
     os.makedirs(out_dir, exist_ok=True)
