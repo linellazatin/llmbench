@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 VERSION = "0.1.0"
+BACKENDS = ["api", "dsh", "codex", "claude", "pi"]  # all known backends
 SCHEMA = 1
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +1549,103 @@ class ClaudeBackend(CliBackend):
                 pass
 
 
+class PiBackend(CliBackend):
+    """pi --mode json — one-shot JSONL session events (assistant messages,
+    usage, tool results). The per-run agent dir under scratch
+    (PI_CODING_AGENT_DIR) carries a self-contained models.json defining the
+    "llmbench" provider, so --endpoint/--model/--api-key are honored exactly
+    like the dsh overlay and the user's ~/.pi/agent is never touched.
+
+    No trust or permission plumbing is needed: a bare scratch dir triggers no
+    trust prompt, and pi runs tools without per-call approval in one-shot mode.
+    """
+
+    name = "pi"
+
+    def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
+        cfg = self.cfg
+        self._prompt = self.full_prompt(t)  # only used for token estimation
+        agent_dir = os.path.join(scratch, ".pi-agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        with open(os.path.join(agent_dir, "models.json"), "w") as f:
+            json.dump({"providers": {"llmbench": {
+                "baseUrl": cfg.endpoint,
+                "api": "openai-completions",
+                "apiKey": cfg.api_key,
+                "models": [{"id": cfg.model,
+                            "contextWindow": 262144, "maxTokens": 8192}],
+            }}}, f, indent=1)
+        cmd = ["pi", "--mode", "json", "--no-session",
+               "--provider", "llmbench", "--model", cfg.model,
+               "--api-key", cfg.api_key]
+        if t.get("system"):
+            cmd += ["--append-system-prompt", t["system"]]
+        cmd += ["--", t["prompt"]]
+        env = dict(os.environ)
+        env["PI_CODING_AGENT_DIR"] = agent_dir
+        return cmd, env
+
+    def parse_line(self, outcome: TaskOutcome, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        et = ev.get("type")
+        if et == "message_start":
+            # fresh assistant response: reset the per-response usage tracker
+            outcome._pi_pending_usage = None
+            if (ev.get("message") or {}).get("role") == "assistant" \
+                    and outcome.ttft_model_s is None:
+                outcome.ttft_model_s = time.monotonic()
+        elif et == "message_update":
+            u = ev.get("usage") or {}
+            if u.get("input") or u.get("output") or u.get("totalTokens"):
+                outcome._pi_pending_usage = u
+        elif et == "message_end":
+            m = ev.get("message") or {}
+            if m.get("role") != "assistant":
+                return
+            # per-response cumulative usage: prefer the authoritative
+            # message_end.message.usage, else the last message_update.usage
+            u = m.get("usage") or outcome._pi_pending_usage
+            if u:
+                outcome.prompt_tokens = (outcome.prompt_tokens or 0) \
+                    + u.get("input", 0)
+                outcome.completion_tokens = (outcome.completion_tokens or 0) \
+                    + u.get("output", 0)
+                outcome.token_source = "server"
+            text = "".join(b.get("text", "") for b in m.get("content") or []
+                           if isinstance(b, dict) and b.get("type") == "text")
+            if text:
+                outcome.text = text
+                outcome.finish_reason = m.get("stopReason") or "stop"
+            outcome.events.append({"event": "assistant_message_end",
+                                   "stopReason": m.get("stopReason")})
+        elif et == "turn_end":
+            for tr in (ev.get("toolResults") or [])[:10]:
+                outcome.events.append({
+                    "event": "tool_result",
+                    "toolName": tr.get("toolName"),
+                    "isError": tr.get("isError")})
+        elif et in ("agent_end", "agent_settled"):
+            # agent_settled is the true terminal (auto-retry/compaction can
+            # follow agent_end) — the process exit still closes the run
+            outcome.events.append({"event": et, "aborted": ev.get("aborted")})
+
+    def finalize(self, outcome: TaskOutcome) -> None:
+        outcome.text = outcome.text.strip()
+        super().finalize(outcome)
+        if not outcome.text and not outcome.error:
+            if outcome.exit_code not in (0, None):
+                outcome.error = (f"pi exit {outcome.exit_code}: "
+                                  f"{outcome.stderr_tail[-300:]}")
+            else:
+                outcome.error = "no assistant message received"
+
+
 def build_backend(cfg: "RunConfig"):
     if cfg.backend == "api":
         return ApiBackend(cfg.endpoint, cfg.model, api_key=cfg.api_key,
@@ -1559,6 +1657,8 @@ def build_backend(cfg: "RunConfig"):
         return CodexBackend(cfg)
     if cfg.backend == "claude":
         return ClaudeBackend(cfg)
+    if cfg.backend == "pi":
+        return PiBackend(cfg)
     raise SystemExit(f"unknown backend '{cfg.backend}'")
 
 
@@ -2114,7 +2214,7 @@ TOOLS_TASKS: list[dict] = [
 
 # --- agentic (CLI backends: real shell + file access) -----------------------
 
-CLI_BACKENDS = ["dsh", "codex", "claude"]
+CLI_BACKENDS = ["dsh", "codex", "claude", "pi"]
 
 BUGGY_PY = '''def double_total(nums):
     total = 0
@@ -2427,17 +2527,19 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
                         "cli: spawn -> first stdout byte (includes CLI startup)"),
             "ttft_model_s": ("first MODEL-originated output (api: first token; "
                               "codex: first item event; claude: first assistant event; "
-                              "dsh: final message, since it buffers) — use this for "
-                              "cross-backend model-latency comparisons"),
+                              "pi: first assistant event; dsh: final message, since it "
+                              "buffers) — use this for cross-backend "
+                              "model-latency comparisons"),
             "ttft_first_reasoning_s": "api only: request sent -> first reasoning token",
             "total_s": "api: request sent -> stream closed. cli: spawn -> process exit",
             "decode_tps": "content chunks / (total - ttft) — content-only rate (api only)",
             "gen_tps": "completion tokens / (total - ttft_model_s); includes tool round-trips on cli backends",
             "overall_tps": "completion tokens / total — incl. TTFT",
-            "tokens": ("server usage when reported (token_source=server: codex/claude — "
-                        "cumulative over the task's internal API calls, incl. the "
-                        "harness system prompt), else ~4 chars/token estimate of the "
-                        "task prompt only (token_source=estimate: dsh)"),
+            "tokens": ("server usage when reported (token_source=server: codex/claude/"
+                       "pi — cumulative over the task's internal API calls, incl. the "
+                       "harness system prompt), else ~4 chars/token estimate of the "
+                       "task prompt only (token_source=estimate: dsh, or pi when the "
+                       "provider reports no usage)"),
             "resources": ("sampled at --sample-interval; chip stats are avg/min/peak/p50/p95; "
                            "proc_cpu_pct/proc_rss_mb cover the CLI process tree on cli backends"),
         },
@@ -2869,7 +2971,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="run benchmark suite(s)")
-    pr.add_argument("--backend", choices=["api", "dsh", "codex", "claude"], default="api")
+    pr.add_argument("--backend", choices=BACKENDS, default="api")
     pr.add_argument("--endpoint", default=os.environ.get("LLMBENCH_ENDPOINT",
                                                           "http://127.0.0.1:8000/v1"))
     pr.add_argument("--model", default=os.environ.get("LLMBENCH_MODEL", "qwen3.8"))
@@ -2925,7 +3027,7 @@ def cmd_list(_: argparse.Namespace) -> None:
     for suite_name, tasks_ in SUITES.items():
         print(f"\n[{suite_name}]")
         for t in tasks_:
-            bks = ",".join(t.get("backends", ["api", "dsh", "codex", "claude"]))
+            bks = ",".join(t.get("backends", BACKENDS))
             print(f"  {t['id']:<28} {t['verify']['type']:<12} {bks:<26}")
 
 

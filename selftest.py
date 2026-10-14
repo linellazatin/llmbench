@@ -173,7 +173,7 @@ assert L._fmt_ci(5.0, None) == "5.0"
 # --- agentic suite wiring: CLI-only filter + setup files ---
 ag = {t["id"]: t for t in L.SUITES["agentic"]}
 assert len(ag) == 5
-assert all(t.get("backends") == ["dsh", "codex", "claude"] for t in ag.values())
+assert all(t.get("backends") == L.CLI_BACKENDS for t in ag.values())
 assert "data.txt" in ag["agentic/data-sum"].get("setup", {})
 assert "tools" in {t["id"].split("/")[0] for t in L.SUITES["tools"]}
 assert all(t.get("backends") == ["api"] for t in L.SUITES["tools"])
