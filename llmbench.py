@@ -2708,16 +2708,20 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
                               "pi: first assistant event; dsh: final message, since it "
                               "buffers) — use this for cross-backend "
                               "model-latency comparisons"),
-            "ttft_first_reasoning_s": "api only: request sent -> first reasoning token",
+            "ttft_first_reasoning_s": ("api: request sent -> first reasoning token "
+                                       "(reasoning and reasoning_content deltas both "
+                                       "count). cli backends: degenerate (= ttft_s)"),
             "total_s": "api: request sent -> stream closed. cli: spawn -> process exit",
             "decode_tps": "content chunks / (total - ttft) — content-only rate (api only)",
             "gen_tps": "completion tokens / (total - ttft_model_s); includes tool round-trips on cli backends",
             "overall_tps": "completion tokens / total — incl. TTFT",
-            "tokens": ("server usage when reported (token_source=server: codex/claude/"
+            "tokens": ("server usage when reported (token_source=server: api — the "
+                       "stream's usage chunk; codex/claude/" 
                        "pi — cumulative over the task's internal API calls, incl. the "
                        "harness system prompt), else ~4 chars/token estimate of the "
-                       "task prompt only (token_source=estimate: dsh, or pi when the "
-                       "provider reports no usage)"),
+                       "task prompt only (token_source=estimate: dsh, api against "
+                       "engines with no streamed usage, or pi when the provider "
+                       "reports no usage). completion_tokens includes reasoning tokens"),
             "resources": ("sampled at --sample-interval; chip stats are avg/min/peak/p50/p95; "
                            "proc_cpu_pct/proc_rss_mb cover the CLI process tree on cli backends"),
         },
