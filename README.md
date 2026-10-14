@@ -64,6 +64,157 @@ Claude-specific plumbing (non-interactive agentic as root):
   `Bash`/`Write` access in the scratch dir — fine on an isolated bench host,
   not on a machine with anything you care about.
 
+## Using llmbench per backend — walkthrough & command reference
+
+Every backend shares the same `run` command surface. What differs per
+backend: (a) the CLI invocation and environment the harness assembles,
+(b) which suites are admissible, (c) the backend-specific flags, and
+(d) which shared flags actually take effect on the wire. The shared table
+below lists every flag with its full value space once; each backend table
+then covers its specifics and the differences.
+
+Current task inventory (59 tasks total): `smoke` 3 · `reasoning` 8 ·
+`spatial` 8 · `ifeval` 8 · `coding` 8 · `tools` 8 · `agentic` 5 ·
+`mullang` 8 · `longctx` 3 (opt-in). `list` prints them with verifiers and
+per-task backend gates.
+
+### Shared `run` flags (all backends)
+
+| flag | values | default | notes |
+|---|---|---|---|
+| `--backend` | `api` \| `dsh` \| `codex` \| `claude` \| `pi` | `api` | |
+| `--endpoint` | any `http(s)://` URL (validated; fail-fast exit 2 otherwise), e.g. `http://127.0.0.1:8000/v1` | `$LLMBENCH_ENDPOINT` or `http://127.0.0.1:8000/v1` | the API root the backend talks to |
+| `--model` | any model id the endpoint serves | `$LLMBENCH_MODEL` or `qwen3.8` | for CLI backends also the model name handed to the CLI |
+| `--api-key` | any string | `$LLMBENCH_API_KEY` or `llmbench` | vLLM ignores it, but it is still sent |
+| `--suites` | comma-separated subset of `smoke,reasoning,spatial,ifeval,coding,tools,agentic,mullang,longctx` | all except `longctx` | gated tasks on a non-admitted backend are logged as skipped, not errors |
+| `--tasks` | comma-separated task ids (see `list`), e.g. `reasoning/knights-knaves,coding/caesar` | all in the selected suites | implies the tasks' suites — this is how `longctx` is reachable |
+| `--repeat` | int ≥ 1 | `1` | repeats add 95 % CIs (`*_ci95`) to all aggregates |
+| `--max-tokens` | int | `4096` | **effective on `api` and `pi` only** — the other CLIs have no output-budget knob wired |
+| `--temperature` | float | `0.0` | **effective on `api` only** |
+| `--timeout` | float, seconds | `600` | per-task wall limit; a timeout is an `error` (→ retried) |
+| `--retries` | int ≥ 0 | `1` | extra attempts for tasks that **error** only — a verifier fail is a real verdict and is never retried |
+| `--concurrency` | int ≥ 1 | `1` | load mode: N tasks in flight, each keeping its own resource sampler; the shared endpoint is the load target — run backends sequentially, never in parallel |
+| `--sample-interval` | float, seconds | `2.0` | resource-sampling cadence during each task |
+| `--no-warmup` | flag (no value) | warmup runs | skip the single unscored warmup task |
+| `--npu-container` | docker container name | `$LLMBENCH_NPU_CONTAINER` or auto-detect | NPU state via `docker exec <c> npu-smi info` |
+| `--out` | directory | `<script dir>/results` | run dirs are created under it |
+
+### Other commands
+
+| command | exact form | notes |
+|---|---|---|
+| `list` | `python3 llmbench.py list` | every suite/task with verifier and backend gates |
+| `sample` | `python3 llmbench.py sample [--seconds S] [--interval I] [--container C]` | standalone resource monitor (defaults: 10 s, 2.0 s, env container) |
+| `report` | `python3 llmbench.py report <run_dir>` | re-render `report.md` from an existing `run.json` |
+| `compare` | `python3 llmbench.py compare <run_dir>... [--save FILE.md]` | side-by-side table (also printed); `--save` writes the file |
+
+### api — reference backend
+
+No CLI binary needed; streams `/chat/completions` directly.
+
+```bash
+python3 llmbench.py run --backend api --suites smoke      # 3 tasks — sanity
+python3 llmbench.py run --backend api                    # 51 tasks (longctx opt-in; agentic is CLI-only)
+python3 llmbench.py run --backend api --suites longctx   # + the 3 heavy needle tasks
+python3 llmbench.py run --backend api --tasks reasoning/knights-knaves,coding/caesar
+python3 llmbench.py run --backend api --max-tokens 1024 --temperature 0.2 --suites smoke
+```
+
+| item | value |
+|---|---|
+| invocation | `POST <endpoint>/chat/completions` — streaming, `stream_options.include_usage`, `Bearer` auth |
+| backend-specific flags | — (none) |
+| suites | 8 of 9 (all except CLI-only `agentic`) — 54 admissible, 51 by default (longctx opt-in); the only backend for `tools`, reference for `longctx` |
+| shared flags effective | `--max-tokens` ✓, `--temperature` ✓ (the only backend for both) |
+| tokens / latency | server `usage` (final chunk); `ttft_s` = request → first content token — cleanest numbers, no harness overhead |
+
+### dsh
+
+Requires the `dsh` CLI on PATH.
+
+```bash
+python3 llmbench.py run --backend dsh --suites smoke
+python3 llmbench.py run --backend dsh                       # 48 tasks; tools+longctx auto-skipped (logged)
+python3 llmbench.py run --backend dsh --suites agentic
+python3 llmbench.py run --backend dsh --dsh-api-key-env MY_OTHER_KEY_ENV --suites smoke
+```
+
+| item | value |
+|---|---|
+| invocation | `dsh --profile headless --patch <scratch>/llmbench.patch.yaml <prompt>` (one task per process; prompt as final argv) |
+| per-run overlay | the patch defines a self-contained provider `llmbench` (`baseURL` = `--endpoint`, `api: openai-completions`, `apiKeyEnv`) plus default-model routing → `~/.dsh/settings.yaml` is never touched |
+| env set | `<--dsh-api-key-env>` = `--api-key` |
+| backend-specific flags | `--dsh-api-key-env <NAME>` — name of the env var dsh's per-run provider reads the key from; any non-empty string (default `MY_GATEWAY_API_KEY`) |
+| suites | 7 (all except `tools` [api-only] and `longctx` [argv size limit]) = 48 tasks |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ (no knobs wired for this CLI) |
+| tokens / latency | **estimated** (~4 chars/token of the prompt only, `token_source=estimate`) — dsh prints no usage; fully buffered, so `ttft_model_s` = final message (TTFT ≈ total) |
+
+### codex
+
+Requires the `codex` CLI on PATH.
+
+```bash
+python3 llmbench.py run --backend codex --suites smoke
+python3 llmbench.py run --backend codex                     # 48 tasks; tools+longctx auto-skipped
+python3 llmbench.py run --backend codex --suites agentic    # file ops, shell, fixing a failing unit test
+python3 llmbench.py run --backend codex --codex-provider vllm
+```
+
+| item | value |
+|---|---|
+| invocation | `codex exec --json --skip-git-repo-check --ephemeral -C <scratch> -m <model> -c model_provider=<p> -c model_providers.<p>.base_url=<endpoint> -c model_providers.<p>.name=<p> --dangerously-bypass-approvals-and-sandbox <prompt>` |
+| env set | `OPENAI_API_KEY` = `--api-key` |
+| backend-specific flags | `--codex-provider <NAME>` — the `model_providers` entry name; the harness sets its `base_url`/`name` inline via `-c`, so no pre-existing codex config entry is needed (any string; default `$LLMBENCH_CODEX_PROVIDER` or `vllm`) |
+| suites | 7 (same as dsh) = 48 tasks |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ |
+| tokens / latency | server `usage` from `turn.completed` (cumulative over the task's turns); `ttft_model_s` = first `item.*` event; JSONL stream — events surface in the task `.md` `CLI events` section |
+
+### claude
+
+Requires the `claude` CLI on PATH.
+
+```bash
+python3 llmbench.py run --backend claude --suites smoke
+python3 llmbench.py run --backend claude                   # 48 tasks; tools+longctx auto-skipped
+python3 llmbench.py run --backend claude --suites agentic
+```
+
+| item | value |
+|---|---|
+| invocation | `claude -p --output-format stream-json --verbose --model <m> --no-session-persistence <prompt>` (`+ --append-system-prompt <sys>` for tasks with a system prompt) |
+| env set | `ANTHROPIC_BASE_URL` = `--endpoint` minus the trailing `/v1`; `ANTHROPIC_AUTH_TOKEN` = `ANTHROPIC_API_KEY` = `--api-key` |
+| backend-specific flags | — (none) |
+| suites | 7 (same as dsh) = 48 tasks |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ |
+| tokens / latency | server `usage` from the `result` event; vLLM ≥ 0.23 serves the Anthropic `/v1/messages` protocol natively (no bridge) |
+| notes | per-task trust plumbing is automatic (scratch allowlist + temporary `~/.claude.json` entry, removed after the task) — see the Backends section |
+
+### pi
+
+Requires the `pi` CLI on PATH.
+
+```bash
+python3 llmbench.py run --backend pi --suites smoke
+python3 llmbench.py run --backend pi                        # 51 tasks; only tools auto-skipped
+python3 llmbench.py run --backend pi --suites longctx        # 128k prompt rides pi's stdin
+python3 llmbench.py run --backend pi --tasks longctx/needle-128k
+python3 llmbench.py run --backend pi --pi-tools read,bash --suites smoke
+python3 llmbench.py run --backend pi --pi-thinking off --suites smoke
+```
+
+| item | value |
+|---|---|
+| invocation | `pi --mode json --no-session --provider llmbench --model <m> --api-key <k>` (`+ --append-system-prompt <sys>`, `--tools <list>`, `--thinking <level>` as applicable) `-- <prompt>`; prompts > 96 000 chars are piped via **stdin** instead of argv (Linux per-argument limit), system prompt travels inside that text |
+| per-run overlay | `PI_CODING_AGENT_DIR` = `<scratch>/.pi-agent` holding a self-contained `models.json` (provider `llmbench`, `api: openai-completions`, `maxTokens` mirroring `--max-tokens`) → `~/.pi/agent` is never touched, no trust prompt |
+| backend-specific flags | `--pi-tools <list>` — pi's tool allowlist; entries are the built-in tool names `read,write,edit,bash,grep,find,ls` (glob patterns with `*` work; `+name`/`-name` add/remove against the default set; MCP tools stay enabled unless an entry starts with `mcp__`); default = pi's full default toolset. `--pi-thinking <level>` — `off`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`; on qwen-style vLLM models the level maps to `enable_thinking` (off = off, other = on); default = model default. Thinking text is captured in the task `.md` Reasoning section |
+| suites | 8 (all except api-only `tools`; includes `longctx`) = 51 tasks |
+| shared flags effective | `--max-tokens` ✓ (→ `maxTokens` in the generated `models.json`), `--temperature` ✗ |
+| tokens / latency | server `usage` summed over the task's responses; `ttft_model_s` = first assistant event; fastest CLI observed, lowest prompt-token cost |
+
+After any run: artifacts land in the run dir (see the table in Quick start),
+`report` re-renders, `compare` puts two runs side by side. And the standing
+rule: backends sharing one endpoint run **sequentially** — never in parallel.
+
 ## Metrics (see `metrics_legend` in run.json)
 
 - `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup)
