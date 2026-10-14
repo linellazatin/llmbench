@@ -1494,6 +1494,25 @@ def _claude_trust_write(data: dict, trust: str) -> None:
     os.replace(tmp, trust)
 
 
+def _claude_project_key(scratch: str) -> str:
+    """Project key the running claude CLI uses for the workspace trust entry.
+    Recent claude versions key projects by the enclosing git root, not the
+    cwd — so a trust entry under the scratch path is silently ignored
+    ("workspace has not been trusted") and the allowlist never applies."""
+    try:
+        root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                              cwd=scratch, capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+        if root and os.path.isdir(root):
+            return root
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return scratch
+
+
+_CLAUDE_TRUST_ADDED: dict[str, bool] = {}
+
+
 def _claude_prepare(scratch: str) -> None:
     """Make a scratch dir usable for non-interactive agentic claude runs:
     1. project-level allowlist (<scratch>/.claude/settings.json)
@@ -1514,8 +1533,11 @@ def _claude_prepare(scratch: str) -> None:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 data = {}
-        entry = data.setdefault("projects", {}).setdefault(scratch, {})
+        key = _claude_project_key(scratch)
+        pre = (data.get("projects") or {}).get(key, {}).get("hasTrustDialogAccepted")
+        entry = data.setdefault("projects", {}).setdefault(key, {})
         entry["hasTrustDialogAccepted"] = True
+        _CLAUDE_TRUST_ADDED[key] = not pre
         _claude_trust_write(data, trust)
 
 
@@ -1583,9 +1605,13 @@ class ClaudeBackend(CliBackend):
 
     def after_run(self, scratch: str) -> None:
         """Drop this run's trust entry from ~/.claude.json (it was only needed
-        while the task ran; leaving them accumulates dead paths)."""
+        while the task ran; leaving them accumulates dead paths). Entries the
+        user already had (pre-existing at prepare time) are left in place."""
         trust = os.path.expanduser("~/.claude.json")
         if not os.path.isfile(trust):
+            return
+        key = _claude_project_key(scratch)
+        if not _CLAUDE_TRUST_ADDED.pop(key, False):
             return
         with _claude_trust_lock():
             try:
@@ -1593,7 +1619,7 @@ class ClaudeBackend(CliBackend):
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 return
-            if (data.get("projects") or {}).pop(scratch, None) is None:
+            if (data.get("projects") or {}).pop(key, None) is None:
                 return
             try:
                 _claude_trust_write(data, trust)
