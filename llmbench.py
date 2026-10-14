@@ -36,6 +36,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -77,6 +78,14 @@ def stats(values: list[float]) -> dict:
         "p50": round(percentile(values, 50), 3),
         "p95": round(percentile(values, 95), 3),
     }
+
+
+def stats_ci95(values: list[float]) -> Optional[float]:
+    """95% CI half-width over the (repeated) samples; None for n < 2."""
+    values = [v for v in values if v is not None]
+    if len(values) < 2:
+        return None
+    return round(1.96 * statistics.stdev(values) / math.sqrt(len(values)), 3)
 
 
 def gb(mb: float) -> float:
@@ -2104,6 +2113,112 @@ AGENTIC_TASKS: list[dict] = [
          backends=CLI_BACKENDS),
 ]
 
+# --- multilingual (prompts in the target language; verifiers language-neutral)
+
+MULLANG_TASKS: list[dict] = [
+    task("mullang/zh-arith",
+         "小明有 3 个苹果，又买了 5 袋苹果，每袋 4 个。他现在一共有多少个苹果？"
+         + CONTRACT,
+         {"type": "math", "value": 23}),
+    task("mullang/ja-arith",
+         "りんごが 7 個、みかんが 8 個あります。合わせていくつですか？"
+         + CONTRACT,
+         {"type": "math", "value": 15}),
+    task("mullang/ko-arith",
+         "사과가 6개 있고, 배가 7개 있습니다. 모두 합치면 몇 개입니까?"
+         + CONTRACT,
+         {"type": "math", "value": 13}),
+    task("mullang/ar-math",
+         "عندي 7 تفاحات و8 برتقالات. كم المجموع؟ أجب بالرقم الغربي (0-9) في سطر "
+         "الإجابة." + CONTRACT,
+         {"type": "math", "value": 15}),
+    task("mullang/ru-grid",
+         _GRID_TEXT + (
+             "\n\nДайте КРАЙНЕ КОРОТКИЙ путь от S до G одной строкой ходов "
+             "U, D, L, R (например DRRU), без пробелов." + CONTRACT),
+         {"type": "gridpath", "grid": GRID_B, "expect_len": _GRID_LEN}),
+    task("mullang/de-constraints",
+         "Schreibe eine kurze Antwort auf Deutsch. Bedingung: deine Antwort "
+         "besteht aus genau zwei Sätzen, und der zweite Satz enthält das Wort "
+         "\"Licht\". Thema: ein Leuchtturm bei Nacht.",
+         {"type": "constraints",
+          "checks": [{"type": "sentences", "count": 2},
+                      {"type": "include_all", "words": ["licht"]}]}),
+    task("mullang/es-answer",
+         "En una isla hay caballeros (siempre dicen la verdad) y traidores "
+         "(siempre mienten). A dice: \"Ninguno de los dos es caballero\". "
+         "¿Quién es el caballero? " + CONTRACT,
+         {"type": "answer", "value": "B", "compact": True}),
+    task("mullang/hi-words",
+         "अपने जवाब में ठीक 5 शब्द लिखें। जवाब हिंदी में हो। कोई अन्य वाक्य, "
+         "पंक्ति या संकेत न लिखें।",
+         {"type": "constraints", "checks": [{"type": "words", "min": 5, "max": 5}]}),
+]
+
+# --- longctx (opt-in — excluded from default runs; api backend only) --------
+# CLI backends take the prompt as a process argument (Linux MAX_ARG_STRLEN is
+# 128 KiB per argument), so 128k-token prompts cannot be delivered that way.
+
+def _filler_log(seed: int, n_chars: int) -> str:
+    """Deterministic machine-log filler of ~n_chars characters."""
+    rnd = random.Random(seed)
+    nouns = ["system", "cache", "queue", "thread", "buffer", "packet", "index",
+             "vector", "matrix", "signal", "sensor", "relay", "socket", "module",
+             "kernel", "driver", "tensor", "weight", "gradient", "batch", "shard",
+             "chunk", "frame", "stream", "session", "gateway", "router", "probe"]
+    lines, total, i = [], 0, 0
+    while total < n_chars:
+        w = " ".join(rnd.choices(nouns, k=rnd.randint(6, 14)))
+        s = f"Log {i:07d}: the {w} was inspected and logged at node {i % 97:02d}."
+        lines.append(s)
+        total += len(s) + 1
+        i += 1
+    return "\n".join(lines)
+
+
+def _needle_doc(seed: int, n_chars: int, codes: list[str],
+                positions: list[float]) -> str:
+    """Fisher-free: splice 'MAGIC CODE: X' lines into a filler doc at
+    fractional positions (deterministic for a fixed seed)."""
+    lines = _filler_log(seed, n_chars).split("\n")
+    n_inserted = 0
+    for code, pos in zip(codes, positions):
+        idx = min(len(lines) - 1 - n_inserted, int(len(lines) * pos))
+        lines.insert(idx + n_inserted,
+                     f"MAGIC CODE: {code} — remember this code exactly.")
+        n_inserted += 1
+    return "\n".join(lines)
+
+
+def _longctx(id: str, seed: int, n_chars: int, codes: list[str],
+             positions: list[float], question: str, expected: str) -> dict:
+    doc = _needle_doc(seed, n_chars, codes, positions)
+    prompt = (f"Below is a long machine log.\n\n{doc}\n\n{question}\n"
+              + CONTRACT)
+    return task(id, prompt,
+                {"type": "answer", "value": expected, "compact": True})
+
+
+LONGCTX_TASKS: list[dict] = [
+    _longctx("longctx/needle-8k", seed=101, n_chars=32_000,
+             codes=["QX4V"], positions=[0.50],
+             question="The log contains exactly one line of the form "
+                      "'MAGIC CODE: <code>'. What is the magic code?",
+             expected="QX4V"),
+    _longctx("longctx/multi-32k", seed=202, n_chars=128_000,
+             codes=["A1B2", "C3D4", "E5F6"], positions=[0.25, 0.50, 0.75],
+             question="The log contains exactly three lines of the form "
+                      "'MAGIC CODE: <code>'. List all three codes in the order "
+                      "they appear, separated by commas (e.g. 'AB12, CD34, "
+                      "EF56').",
+             expected="A1B2, C3D4, E5F6"),
+    _longctx("longctx/needle-128k", seed=303, n_chars=512_000,
+             codes=["M3R9"], positions=[0.50],
+             question="The log contains exactly one line of the form "
+                      "'MAGIC CODE: <code>'. What is the magic code?",
+             expected="M3R9"),
+]
+
 SUITES: dict[str, list[dict]] = {
     "smoke": SMOKE_TASKS,
     "reasoning": REASONING_TASKS,
@@ -2112,10 +2227,17 @@ SUITES: dict[str, list[dict]] = {
     "coding": CODING_TASKS,
     "tools": TOOLS_TASKS,
     "agentic": AGENTIC_TASKS,
+    "mullang": MULLANG_TASKS,
+    "longctx": LONGCTX_TASKS,
 }
 # the tools suite (OpenAI `tools` parameter) only makes sense on the api backend
 for _t in TOOLS_TASKS:
     _t.setdefault("backends", ["api"])
+# longctx prompts exceed the CLI per-argument length limit (see above)
+for _t in LONGCTX_TASKS:
+    _t.setdefault("backends", ["api"])
+# heavy prompts: not part of a default run
+DEFAULT_EXCLUDE = {"longctx"}
 
 
 # ---------------------------------------------------------------------------
@@ -2135,6 +2257,8 @@ class RunConfig:
     temperature: float
     timeout: float
     sample_interval: float
+    retries: int
+    concurrency: int
     warmup: bool
     npu_container: Optional[str]
     dsh_api_key_env: str
@@ -2149,8 +2273,12 @@ class RunConfig:
 def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int]:
     out: list[dict] = []
     skipped = 0
+    if cfg.suites:
+        active = set(cfg.suites)
+    else:
+        active = set(SUITES) - DEFAULT_EXCLUDE
     for suite_name, tasks_ in SUITES.items():
-        if cfg.suites and suite_name not in cfg.suites:
+        if suite_name not in active:
             continue
         for t in tasks_:
             if cfg.tasks and t["id"] not in cfg.tasks:
@@ -2191,6 +2319,9 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
     tasks, skipped = selected_tasks(cfg)
     if skipped:
         log(f"[llmbench] {skipped} task(s) skipped (backend '{cfg.backend}' not supported)")
+    if not cfg.suites and DEFAULT_EXCLUDE:
+        log(f"[llmbench] default run excludes heavy suite(s) "
+            f"{sorted(DEFAULT_EXCLUDE)} — select explicitly with --suites")
     if not tasks:
         log("[llmbench] no tasks matched; nothing to do")
         sys.exit(2)
@@ -2201,9 +2332,11 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
         "started_at": now_iso(),
         "config": {
             "backend": cfg.backend, "model": cfg.model, "endpoint": cfg.endpoint,
-            "suites": cfg.suites or sorted(SUITES), "task_filter": cfg.tasks,
+            "suites": cfg.suites or sorted(set(SUITES) - DEFAULT_EXCLUDE),
+            "task_filter": cfg.tasks,
             "repeat": cfg.repeat, "max_tokens": cfg.max_tokens,
             "temperature": cfg.temperature, "timeout_s": cfg.timeout,
+            "retries": cfg.retries, "concurrency": cfg.concurrency,
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
             "codex_provider": cfg.codex_provider,
         },
@@ -2239,11 +2372,38 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             log(f"[llmbench] warmup failed ({type(e).__name__}: {e}); continuing")
         time.sleep(0.5)
 
-    for rep in range(cfg.repeat):
-        for t in tasks:
+    def _one(t: dict, rep: int) -> dict:
+        """Run one task, retrying only hard errors (a 'fail' is a real verdict)."""
+        r = None
+        attempt = 0
+        for attempt in range(cfg.retries + 1):
             r = run_one_task(cfg, t, backend, prober, out_dir, rep, log)
+            if r["status"] != "error":
+                break
+            if attempt < cfg.retries:
+                log(f"[llmbench] retry {attempt + 1}/{cfg.retries} for {t['id']}: "
+                    f"{(r.get('error') or 'error')[:80]}")
+        r["attempts"] = attempt + 1
+        return r
+
+    for rep in range(cfg.repeat):
+        if cfg.concurrency > 1 and len(tasks) > 1:
+            # load mode: N tasks in flight; each keeps its own resource sampler
+            results: list[Optional[dict]] = [None] * len(tasks)
+            with ThreadPoolExecutor(max_workers=cfg.concurrency) as ex:
+                futs = {ex.submit(_one, t, rep): i for i, t in enumerate(tasks)}
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    results[i] = fut.result()
+                    log(console_line(results[i]))
+        else:
+            results = []
+            for t in tasks:
+                r = _one(t, rep)
+                results.append(r)
+                log(console_line(r))
+        for r in results:
             run["tasks"].append(r)
-            log(console_line(r))
 
     run["finished_at"] = now_iso()
     run["totals"] = compute_totals(run["tasks"])
@@ -2258,6 +2418,9 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     rid = t["id"] if rep == 0 else f"{t['id']}#r{rep}"
     task_key = rid.replace("/", "__").replace("#", "_")
     scratch = os.path.join(out_dir, "work", task_key)
+    # wipe stale artifacts (e.g. a half-written solution.py from a crashed
+    # attempt must not leak into a retry's verdict)
+    shutil.rmtree(scratch, ignore_errors=True)
     os.makedirs(scratch, exist_ok=True)
     for fname, content in (t.get("setup") or {}).items():
         with open(os.path.join(scratch, fname), "w") as f:
@@ -2400,10 +2563,14 @@ def compute_totals(task_results: list[dict]) -> dict:
             "pass_rate": round(sum(1 for r in scored if r["verdict"].get("passed"))
                               / len(scored), 3) if scored else None,
             "ttft_s": stats([r["ttft_s"] for r in rs]),
+            "ttft_s_ci95": stats_ci95([r["ttft_s"] for r in rs]),
             "ttft_model_s": stats([r.get("ttft_model_s") for r in rs]),
+            "ttft_model_s_ci95": stats_ci95([r.get("ttft_model_s") for r in rs]),
             "total_s": stats([r["total_s"] for r in rs]),
+            "total_s_ci95": stats_ci95([r["total_s"] for r in rs]),
             "decode_tps": stats([r["decode_tps"] for r in rs]),
             "gen_tps": stats([r["gen_tps"] for r in rs]),
+            "gen_tps_ci95": stats_ci95([r["gen_tps"] for r in rs]),
             "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in rs),
             "completion_tokens": sum(r.get("completion_tokens") or 0 for r in rs),
         }
@@ -2433,11 +2600,15 @@ def compute_totals(task_results: list[dict]) -> dict:
         "n_error": sum(1 for r in task_results if r.get("error")),
         "suites": suites_out,
         "ttft_s": stats([r["ttft_s"] for r in ok]),
+        "ttft_s_ci95": stats_ci95([r["ttft_s"] for r in ok]),
         "ttft_model_s": stats([r.get("ttft_model_s") for r in ok]),
+        "ttft_model_s_ci95": stats_ci95([r.get("ttft_model_s") for r in ok]),
         "token_source": _token_source_label(task_results),
         "total_s": stats([r["total_s"] for r in ok]),
+        "total_s_ci95": stats_ci95([r["total_s"] for r in ok]),
         "decode_tps": stats([r["decode_tps"] for r in ok]),
         "gen_tps": stats([r["gen_tps"] for r in ok]),
+        "gen_tps_ci95": stats_ci95([r["gen_tps"] for r in ok]),
         "overall_tps": stats([r["overall_tps"] for r in ok]),
         "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in ok),
         "completion_tokens": sum(r.get("completion_tokens") or 0 for r in ok),
@@ -2550,6 +2721,13 @@ def render_report_md(run: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+def _fmt_ci(avg: Any, ci: Any) -> str:
+    """'12.3 ±0.4' when a repeat-based CI exists, else just the value."""
+    if ci is None:
+        return str(avg if avg is not None else "—")
+    return f"{avg if avg is not None else '—'} ±{ci}"
+
+
 def console_summary(run: dict, log: Callable[[str], None] = print) -> None:
     tot = run["totals"]
     log("\n[llmbench] === summary ===")
@@ -2558,8 +2736,10 @@ def console_summary(run: dict, log: Callable[[str], None] = print) -> None:
     for suite, s in sorted(tot["suites"].items()):
         pr = fnum(s["pass_rate"] * 100, 1) if s["pass_rate"] is not None else "—"
         log(f"  {suite:<14} {s['passed']}/{s['n']} pass ({pr}%)  "
-            f"ttft avg {s['ttft_s'].get('avg')}s  total avg {s['total_s'].get('avg')}s  "
-            f"gen {s['gen_tps'].get('avg')} tok/s (content {s['decode_tps'].get('avg')})")
+            f"ttft avg {_fmt_ci(s['ttft_s'].get('avg'), s.get('ttft_s_ci95'))}s  "
+            f"total avg {_fmt_ci(s['total_s'].get('avg'), s.get('total_s_ci95'))}s  "
+            f"gen {_fmt_ci(s['gen_tps'].get('avg'), s.get('gen_tps_ci95'))} tok/s "
+            f"(content {s['decode_tps'].get('avg')})")
     log(f"tokens: {tot['prompt_tokens']} prompt / {tot['completion_tokens']} completion "
         f"/ {tot['total_tokens']} total")
 
@@ -2609,6 +2789,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--max-tokens", type=int, default=4096)
     pr.add_argument("--temperature", type=float, default=0.0)
     pr.add_argument("--timeout", type=float, default=600.0)
+    pr.add_argument("--retries", type=int, default=1,
+                   help="extra attempts for tasks that ERROR (not for genuine fails); "
+                        "default 1")
+    pr.add_argument("--concurrency", type=int, default=1,
+                   help="tasks in flight at once (load mode; >1 shares the endpoint)")
     pr.add_argument("--sample-interval", type=float, default=2.0)
     pr.add_argument("--warmup", dest="warmup", action="store_true", default=True)
     pr.add_argument("--no-warmup", dest="warmup", action="store_false")
@@ -2745,6 +2930,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         repeat=args.repeat, max_tokens=args.max_tokens,
         temperature=args.temperature, timeout=args.timeout,
         sample_interval=args.sample_interval,
+        retries=args.retries, concurrency=args.concurrency,
         warmup=args.warmup, npu_container=args.npu_container,
         dsh_api_key_env=args.dsh_api_key_env,
         codex_provider=args.codex_provider,

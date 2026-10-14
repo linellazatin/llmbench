@@ -95,7 +95,8 @@ block and in the report's Resources section.
 ## Suites
 
 All tasks are original and deterministic (no dataset downloads, no network
-needed). Select with `--suites` (comma-separated; default = all).
+needed). Select with `--suites` (comma-separated; default = all **except the
+opt-in `longctx` suite**, which you must name explicitly).
 
 | suite | tasks | what's scored | verifier |
 |---|---|---|---|
@@ -106,8 +107,23 @@ needed). Select with `--suites` (comma-separated; default = all).
 | `coding` | 8 | original unit-tested problems (anagram, roman, intervals, moving avg, parens, flatten, caesar, top-k) | solution read from `scratch/solution.py` if the agent wrote one, else extracted from the first ` ```python ` block; unittest suite run (60 s timeout) |
 | `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
 | `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude) |
+| `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count (hi) | existing verifiers (math / gridpath / constraints / answer) — language-neutral |
+| `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — 8k, 32k (3 needles, order), 128k tokens | `ANSWER:` exact/ordered (api backend only; a 128k-token prompt exceeds the CLI per-argument length limit) |
 
 `python3 selftest.py` runs fast offline verifier self-tests.
+
+## Run modes
+
+- `--retries N` (default 1) — re-attempt a task that **errors** (transport/
+  crash), not one that merely fails its verifier (a fail is a real verdict).
+  Each task records its `attempts`; the scratch dir is wiped between attempts so
+  a crashed run's half-written `solution.py` can't leak into a retry.
+- `--concurrency N` (default 1) — run N tasks in flight (load mode). Each task
+  keeps its own resource sampler, so per-task NPU/CPU samples stay attributed;
+  the shared endpoint is the thing under load.
+- `--repeat N` — repeat every task N times. Aggregates then carry a 95% CI
+  (`*_ci95` fields in `run.json`; `±` in the console summary) so single-run
+  wiggles are distinguishable from signal.
 
 ## Notes / host facts (2026-10-13)
 

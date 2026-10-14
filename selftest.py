@@ -78,6 +78,40 @@ with tempfile.TemporaryDirectory() as wd:
                            {"cmd": ["python3", "bad.py"],
                             "timeout": 30})["passed"]
 
+# --- mullang: ground truths ---
+ml = {t["id"]: t for t in L.SUITES["mullang"]}
+assert len(ml) == 8
+assert ml["mullang/zh-arith"]["verify"]["value"] == 3 + 5 * 4
+assert ml["mullang/ja-arith"]["verify"]["value"] == 7 + 8
+assert ml["mullang/ko-arith"]["verify"]["value"] == 6 + 7
+assert ml["mullang/ar-math"]["verify"]["value"] == 7 + 8
+assert ml["mullang/es-answer"]["verify"]["value"] == "B"
+assert ml["mullang/ru-grid"]["verify"]["expect_len"] == L._GRID_LEN
+assert ml["mullang/ru-grid"]["verify"]["grid"] == L.GRID_B
+# devanagari word counting (hi-words verifier path)
+import re as _re
+assert len(_re.findall(r"\S+", "नमस्ते दुनिया में आपका स्वागत")) == 5
+
+# --- longctx: ground-truth sanity (codes appear exactly once, in order) ---
+for t in L.SUITES["longctx"]:
+    needles = [ln for ln in t["prompt"].split("\n") if ln.startswith("MAGIC CODE:")]
+    codes = [ln.split("MAGIC CODE: ")[1].split(" ")[0] for ln in needles]
+    assert len(needles) == len(set(needles)), t["id"]
+    exp = t["verify"]["value"]
+    if "," in exp:
+        assert codes == exp.split(", "), (t["id"], codes, exp)
+    else:
+        assert codes == [exp], (t["id"], codes, exp)
+assert all(t.get("backends") == ["api"] for t in L.SUITES["longctx"])
+assert "longctx" in L.DEFAULT_EXCLUDE
+
+# --- CI helper ---
+assert L.stats_ci95([1.0, 2.0, 3.0]) is not None
+assert L.stats_ci95([1.0]) is None
+assert L.stats_ci95([]) is None
+assert L._fmt_ci(5.0, 0.25) == "5.0 ±0.25"
+assert L._fmt_ci(5.0, None) == "5.0"
+
 # --- agentic suite wiring: CLI-only filter + setup files ---
 ag = {t["id"]: t for t in L.SUITES["agentic"]}
 assert len(ag) == 5
