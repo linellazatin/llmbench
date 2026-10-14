@@ -44,7 +44,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 VERSION = "0.1.0"
-BACKENDS = ["api", "dsh", "codex", "claude", "pi"]  # all known backends
 SCHEMA = 1
 
 # ---------------------------------------------------------------------------
@@ -1567,6 +1566,7 @@ class PiBackend(CliBackend):
         self._prompt = self.full_prompt(t)  # only used for token estimation
         agent_dir = os.path.join(scratch, ".pi-agent")
         os.makedirs(agent_dir, exist_ok=True)
+        # self-contained: pi reads ONLY this file, so no user-model bleed
         with open(os.path.join(agent_dir, "models.json"), "w") as f:
             json.dump({"providers": {"llmbench": {
                 "baseUrl": cfg.endpoint,
@@ -1646,20 +1646,38 @@ class PiBackend(CliBackend):
                 outcome.error = "no assistant message received"
 
 
+@dataclass(frozen=True)
+class BackendSpec:
+    """One BACKEND_REGISTRY row: how to construct the backend plus the
+    per-backend CLI flags to register (names follow the --<backend>-<key>
+    convention and surface as the underscored RunConfig field of the same
+    name). Adding a backend = one class + one row here."""
+    factory: Callable[["RunConfig"], object]
+    flags: tuple = ()  # (arg name, default, help)
+
+
+BACKEND_REGISTRY: dict[str, BackendSpec] = {
+    "api": BackendSpec(factory=lambda cfg: ApiBackend(
+        cfg.endpoint, cfg.model, api_key=cfg.api_key, max_tokens=cfg.max_tokens,
+        temperature=cfg.temperature, timeout=cfg.timeout)),
+    "dsh": BackendSpec(factory=lambda cfg: DshBackend(cfg), flags=(
+        ("--dsh-api-key-env", "MY_GATEWAY_API_KEY",
+         "env var name dsh's per-run provider reads the API key from"),)),
+    "codex": BackendSpec(factory=lambda cfg: CodexBackend(cfg), flags=(
+        ("--codex-provider", os.environ.get("LLMBENCH_CODEX_PROVIDER", "vllm"),
+         "codex model_providers entry name (default: vllm)"),)),
+    "claude": BackendSpec(factory=lambda cfg: ClaudeBackend(cfg)),
+    "pi": BackendSpec(factory=lambda cfg: PiBackend(cfg)),
+}
+BACKENDS = list(BACKEND_REGISTRY)  # all known backends
+
+
 def build_backend(cfg: "RunConfig"):
-    if cfg.backend == "api":
-        return ApiBackend(cfg.endpoint, cfg.model, api_key=cfg.api_key,
-                          max_tokens=cfg.max_tokens, temperature=cfg.temperature,
-                          timeout=cfg.timeout)
-    if cfg.backend == "dsh":
-        return DshBackend(cfg)
-    if cfg.backend == "codex":
-        return CodexBackend(cfg)
-    if cfg.backend == "claude":
-        return ClaudeBackend(cfg)
-    if cfg.backend == "pi":
-        return PiBackend(cfg)
-    raise SystemExit(f"unknown backend '{cfg.backend}'")
+    try:
+        spec = BACKEND_REGISTRY[cfg.backend]
+    except KeyError:
+        raise SystemExit(f"unknown backend '{cfg.backend}'")
+    return spec.factory(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -2993,11 +3011,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--warmup", dest="warmup", action="store_true", default=True)
     pr.add_argument("--no-warmup", dest="warmup", action="store_false")
     pr.add_argument("--npu-container", default=os.environ.get("LLMBENCH_NPU_CONTAINER"))
-    pr.add_argument("--dsh-api-key-env", default="MY_GATEWAY_API_KEY",
-                    help="env var name dsh's per-run provider reads the API key from")
-    pr.add_argument("--codex-provider", default=os.environ.get("LLMBENCH_CODEX_PROVIDER",
-                                                               "vllm"),
-                    help="codex model_providers entry name (default: vllm)")
+    # per-backend config flags register from the registry (one code path;
+    # order = registry order, which matches the historical help layout)
+    for _spec in BACKEND_REGISTRY.values():
+        for _flag, _default, _help in _spec.flags:
+            pr.add_argument(_flag, default=_default, help=_help)
     pr.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                    "results"))
     pr.set_defaults(func=cmd_run)
