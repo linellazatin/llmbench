@@ -448,6 +448,229 @@ assert "not in /models list" in L.preflight_report('{"data": [{"id": "m1"}]}', "
 assert "non-OpenAI" in L.preflight_report("not json", "m")
 assert "non-OpenAI" in L.preflight_report('{"data": "nope"}', "m1")
 
+# --- api request body: temperature is OMITTED unless explicitly set ----------
+# Default None + omit-the-key (never null) is what makes the harness measure
+# the endpoint's configured sampling, and what lets reasoning endpoints that
+# reject the parameter answer at all.
+_ab = L.ApiBackend("http://127.0.0.1:1/v1", "m")
+assert _ab.temperature is None
+_body = _ab.request_body([{"role": "user", "content": "x"}])
+assert "temperature" not in _body, _body
+assert _body["max_tokens"] == 4096 and _body["stream_options"]
+assert _ab.request_body([{"role": "user", "content": "x"}],
+                        tools=[{"type": "function"}])["tools"]
+for _tv in (0.0, 0.7):  # 0.0 must still be sent (greedy baselines)
+    _b = L.ApiBackend("http://127.0.0.1:1/v1", "m", temperature=_tv)\
+        .request_body([{"role": "user", "content": "x"}])
+    assert _b["temperature"] == _tv, _b
+
+# --- retry policy: only transient/transport shapes are retried ---------------
+assert not L.retryable_status(400)      # unsupported param / context too long
+assert not L.retryable_status(404) and not L.retryable_status(422)
+assert L.retryable_status(408) and L.retryable_status(429)
+assert L.retryable_status(500) and L.retryable_status(503)
+
+# --- longctx: token-based sizing, 128k-window fit, and the context gate ------
+_lc = {t["id"]: t for t in L.SUITES["longctx"]}
+assert all(t.get("min_context_tokens") for t in _lc.values())
+# the conservative divisor (3.8) must never understate what chars//4 claims
+for _id, _t in _lc.items():
+    assert _t["min_context_tokens"] >= len(_t["prompt"]) // 4, _id
+# top tier + the default output budget fits both 128000 and 131072 windows
+_heavy = _lc["longctx/needle-128k"]["min_context_tokens"] + 4096
+assert _heavy <= 128_000, (_heavy, "128k-class models must be able to run it")
+assert len(_lc["longctx/needle-128k"]["prompt"]) < 512_000
+
+
+def _scfg(backend="api", context_tokens=0, max_tokens=4096, **kw):
+    base = dict(backend=backend, model="m",
+                endpoint="http://127.0.0.1:1/v1", api_key="k",
+                suites=["longctx"], tasks=[], repeat=1, max_tokens=max_tokens,
+                temperature=None, timeout=600.0, sample_interval=2.0,
+                retries=1, concurrency=1, warmup=False, npu_container=None,
+                dsh_api_key_env="X", codex_provider="vllm")
+    base.update(kw)
+    return L.RunConfig(context_tokens=context_tokens, **base)
+
+
+# window unknown (default): everything is sent, exactly as before
+_ids = [t["id"] for t in L.selected_tasks(_scfg())[0]]
+assert _ids == list(_lc), _ids
+# 128k-class windows: all three tiers still fit (incl. pi's ~3.1k scaffolding)
+for _ctx in (128_000, 131_072, 262_144):
+    for _bk in ("api", "pi"):
+        _ids = [t["id"] for t in L.selected_tasks(
+            _scfg(_bk, context_tokens=_ctx))[0]]
+        assert _ids == list(_lc), (_bk, _ctx, _ids)
+# smaller windows: only the over-sized tiers are skipped
+_sel, _sk, _big = L.selected_tasks(_scfg("api", context_tokens=65_536))
+assert [t["id"] for t in _sel] == ["longctx/needle-8k", "longctx/multi-32k"]
+assert [d["id"] for d in _big] == ["longctx/needle-128k"], _big
+# a skip carries its own arithmetic, so the reason is legible without the code
+_d = _big[0]
+assert _d["prompt_est"] == _lc["longctx/needle-128k"]["min_context_tokens"]
+assert _d["need"] == _d["prompt_est"] + _d["max_tokens"] + _d["scaffold_est"]
+assert _d["scaffold_est"] == 0 and _d["declared_context"] == 65_536
+assert _d["shortfall"] == _d["need"] - 65_536 > 0
+assert L.context_shortfall(_scfg("api", context_tokens=65_536),
+                           _lc["longctx/needle-128k"]) == _d["shortfall"]
+_sel, _sk, _big = L.selected_tasks(_scfg("api", context_tokens=32_768))
+assert [t["id"] for t in _sel] == ["longctx/needle-8k"], [t["id"] for t in _sel]
+assert [d["id"] for d in _big] == ["longctx/multi-32k", "longctx/needle-128k"], _big
+_sel, _sk, _big = L.selected_tasks(_scfg("api", context_tokens=12_288))
+assert _sel == [] and [d["id"] for d in _big] == list(_lc), (len(_sel), _big)
+# pi's scaffolding raises the bar a little
+_sel, _sk, _big = L.selected_tasks(_scfg("pi", context_tokens=12_288))
+assert _sel == [] and [d["id"] for d in _big] == list(_lc), (len(_sel), _big)
+assert all(d["scaffold_est"] == L._PI_SCAFFOLD_TOKENS for d in _big)
+# a larger --max-tokens reservation raises the bar accordingly
+assert L.context_shortfall(_scfg("api", context_tokens=128_000, max_tokens=8_192),
+                           _lc["longctx/needle-128k"]) > 0
+assert L.context_shortfall(_scfg("api", context_tokens=128_000),
+                           _lc["longctx/needle-128k"]) == 0
+# pi pays for its own scaffolding
+assert L.context_shortfall(_scfg("pi", context_tokens=128_000),
+                           _lc["longctx/needle-128k"]) == 0
+assert L.context_shortfall(_scfg("pi", context_tokens=125_000),
+                           _lc["longctx/needle-128k"]) > 0
+
+# pi declares the real window in its generated models.json (was 262144 always)
+with _tmp.TemporaryDirectory() as scratch:
+    L.PiBackend(_bcfg("pi")).build(BTASK, scratch)
+    _m = _json.load(open(_os.path.join(scratch, ".pi-agent", "models.json")))
+    assert _m["providers"]["llmbench"]["models"][0]["contextWindow"] == 262144
+    L.PiBackend(_bcfg("pi", context_tokens=131_072)).build(BTASK, scratch)
+    _m = _json.load(open(_os.path.join(scratch, ".pi-agent", "models.json")))
+    assert _m["providers"]["llmbench"]["models"][0]["contextWindow"] == 131_072
+
+# --- strict vs content: a decorated correct answer is still a strict fail ----
+def _v(ty, spec, resp):
+    return L.VERIFIERS[ty]({"response": resp, "tool_calls": [], "task_id": "x",
+                            "out_dir": "/tmp", "scratch": "/tmp"}, spec)
+
+_M = {"value": 408}
+for _r, _strict, _content in [
+        ("ANSWER: 408", True, True),
+        ("ANSWER: **408**", False, True),        # markdown emphasis
+        ("ANSWER: 408 items", False, True),      # trailing unit
+        ("ANSWER: The answer is 408.", False, True),
+        ("ANSWER: 409", False, False),           # genuinely wrong
+        ("ANSWER: 1,408", False, False),         # different number, not a separator
+        ("ANSWER: 1408", False, False)]:
+    _v_ = _v("math", _M, _r)
+    assert bool(_v_["passed"]) is _strict, (_r, _v_)
+    assert bool(_v_["content_ok"]) is _content, (_r, _v_)
+
+_A = {"value": "A", "compact": True}
+for _r, _strict, _content in [
+        ("ANSWER: A", True, True),
+        ("ANSWER: A is the knight", False, True),        # the real-world flip
+        ("ANSWER: **A**", False, True),
+        ("ANSWER: the answer is A", False, True),
+        ("ANSWER: B is the knight", False, False),
+        ("ANSWER: 4A", False, False)]:
+    _v_ = _v("answer", _A, _r)
+    assert bool(_v_["passed"]) is _strict, (_r, _v_)
+    assert bool(_v_["content_ok"]) is _content, (_r, _v_)
+
+# ordered multi-value answers keep their order requirement in both readings
+_O = {"value": "A1B2, C3D4, E5F6", "compact": True}
+assert _v("answer", _O, "ANSWER: **A1B2, C3D4, E5F6**")["content_ok"] is True
+assert _v("answer", _O, "ANSWER: E5F6, C3D4, A1B2")["content_ok"] is False
+
+# whole-reply exact tasks: trailing punctuation passes strictly (the agreed
+# smoke/pong change); prose around the value is a strict fail but does count as
+# delivered -- content_ok means "the value appears", not "it was asserted"
+assert _v("exact", {"value": "pong"}, "Pong.")["passed"] is True
+assert _v("exact", {"value": "pong"}, "The word is pong")["passed"] is False
+assert _v("exact", {"value": "pong"}, "The word is pong")["content_ok"] is True
+assert _v("exact", {"value": "pong"}, "The word is ping")["content_ok"] is False
+assert _v("exact", {"value": "pong"}, "Pong.")["content_ok"] is True
+
+# move strings: strict needs a bare run, content accepts decoration around a
+# valid shortest path (DDDDRRRR is the real answer for the task grid)
+_G = {"grid": ["S....", ".###.", ".#.#.", ".###.", "....G"], "expect_len": 8}
+assert _v("gridpath", _G, "ANSWER: DDDDRRRR")["passed"] is True
+assert _v("gridpath", _G, "ANSWER: **DDDDRRRR**")["passed"] is False
+assert _v("gridpath", _G, "ANSWER: **DDDDRRRR**")["content_ok"] is True
+assert _v("gridpath", _G, "ANSWER: DDRR")["content_ok"] is False
+
+# number scanning keeps whole numbers: 4+ digit runs must not split at 3 digits,
+# and a thousands separator must not be read as two values
+assert L._numbers_in("**5888**") == [5888.0]
+assert L._numbers_in("1,408.50") == [1408.5]
+assert L._numbers_in("total 5888 of 12") == [5888.0, 12.0]
+assert L._value_present("ANSWER: 5888", "5888", numeric=True) is True
+assert L._value_present("ANSWER: 1,408", "408", numeric=True) is False
+
+# totals split: strict passes and delivered values are counted separately
+def _tres(status, verdict):
+    return {"id": status, "task_id": status, "suite": "s", "repeat": 0,
+            "backend": "api", "status": status, "verdict": verdict, "error": None,
+            "retryable": True, "truncated": False, "ttft_s": 1.0, "total_s": 2.0,
+            "ttft_model_s": 1.0, "ttft_first_reasoning_s": None,
+            "decode_tps": 5.0, "gen_tps": 5.0, "overall_tps": 5.0,
+            "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+            "token_source": "server", "resources": {}}
+
+_rs = [_tres("pass", {"passed": True}),
+       _tres("fail", {"passed": False, "content_ok": True}),
+       _tres("fail", {"passed": False, "content_ok": False})]
+_tt = L.compute_totals(_rs)
+assert _tt["n_pass"] == 1 and _tt["n_content"] == 2, _tt
+assert _tt["suites"]["s"]["passed"] == 1 and _tt["suites"]["s"]["content"] == 2
+assert _tt["suites"]["s"]["content_rate"] > _tt["suites"]["s"]["pass_rate"]
+
+# --- verdict integrity: an empty answer is never a silent pass --------------
+class _EmptyBackend:
+    name = "stub"
+
+    def __init__(self, outcome, writes=None):
+        self._o = outcome
+        self._writes = writes or {}
+
+    def run(self, t, scratch, set_root):
+        # stand in for an agent that produced files but no reply text
+        for name, content in self._writes.items():
+            with open(_os.path.join(scratch, name), "w") as f:
+                f.write(content)
+        return self._o
+
+
+_ET = L.task("probe/empty", "hi", {"type": "exact", "value": "pong"})
+with _tmp.TemporaryDirectory() as out_dir:
+    # reasoning stream ate the output budget: a fail, with the reason recorded
+    _o = L.TaskOutcome(finish_reason="length", reasoning_chunks=1024,
+                       completion_tokens=4096)
+    _r = L.run_one_task(_scfg(), _ET, _EmptyBackend(_o), L.NPUProber(None),
+                        out_dir, 0, lambda s: None)
+    assert _r["status"] == "fail", _r["status"]
+    assert _r["verdict"] and not _r["verdict"]["passed"]
+    assert "output budget" in _r["verdict"]["detail"], _r["verdict"]
+    assert _r["truncated"] is True
+    # truly empty response: an error (worth a retry), not a pass
+    _o2 = L.TaskOutcome(finish_reason=None)
+    _r2 = L.run_one_task(_scfg(), _ET, _EmptyBackend(_o2), L.NPUProber(None),
+                         out_dir, 0, lambda s: None)
+    assert _r2["status"] == "error" and not _r2.get("verdict"), _r2
+    # a rejected request is flagged non-retryable so the retry loop skips it
+    _o3 = L.TaskOutcome(error="HTTP 400: nope", retryable=False)
+    _r3 = L.run_one_task(_scfg(), _ET, _EmptyBackend(_o3), L.NPUProber(None),
+                         out_dir, 0, lambda s: None)
+    assert _r3["status"] == "error" and _r3["retryable"] is False
+    # a workspace verifier is scored even when the reply is empty: the agent
+    # did the work, so the verdict is real (and a missing file is a fail, not
+    # an "empty response" error)
+    _ft = L.task("probe/file", "write pong.txt",
+                 {"type": "file", "path": "pong.txt", "content": "pong"})
+    _r4 = L.run_one_task(_scfg(), _ft, _EmptyBackend(L.TaskOutcome(),
+                                                    {"pong.txt": "pong"}),
+                         L.NPUProber(None), out_dir, 0, lambda s: None)
+    assert _r4["status"] == "pass", (_r4["status"], _r4.get("error"))
+    _r5 = L.run_one_task(_scfg(), _ft, _EmptyBackend(L.TaskOutcome()),
+                         L.NPUProber(None), out_dir, 0, lambda s: None)
+    assert _r5["status"] == "fail" and _r5["verdict"]["detail"] == "file missing", _r5
+
 print("api parser probes OK")
 print("backend characterization probes OK")
 print("verifier self-tests OK")

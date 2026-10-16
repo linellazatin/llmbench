@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCHEMA = 1
 
 # ---------------------------------------------------------------------------
@@ -538,8 +538,11 @@ def _num(x: str) -> Optional[float]:
 def check_exact(ctx: dict, spec: dict) -> dict:
     got = ctx["response"].strip()
     want = str(spec["value"]).strip()
-    ok = got.lower() == want.lower()
-    return {"passed": ok, "expected": want, "actual": got[:200]}
+    # trailing sentence punctuation is not a wrong answer ('pong.' == 'pong'),
+    # consistent with how check_answer already treats it
+    ok = _strip_end_punct(got).lower() == _strip_end_punct(want).lower()
+    return {"passed": ok, "expected": want, "actual": got[:200],
+            "content_ok": ok or _value_anywhere(got, want)}
 
 
 def _norm(s: str) -> str:
@@ -552,6 +555,84 @@ def _strip_end_punct(s: str) -> str:
     return s.rstrip(".,;:!?'\")").strip()
 
 
+# --- content-vs-form split ------------------------------------------------ --
+# A sampled (or just talkative) model gets the right value and dresses it up:
+# 'ANSWER: **408**', 'ANSWER: 408 items', 'ANSWER: A is the knight'. Scored
+# strictly that is a fail; scored leniently it stops measuring instruction
+# adherence. So both numbers are recorded: `passed` stays the strict contract
+# verdict (comparable with the recorded baselines), and `content_ok` answers a
+# different question — *was the expected value actually delivered?* — which is
+# what separates "the model is wrong" from "the model did not format it".
+
+_DECOR_RE = re.compile(r"[*_~`$\"'\[\]{}()]")
+_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+                        "01234567890123456789")
+_NUM_RE = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?")
+
+
+def _undecorate(s: str) -> str:
+    """Markdown / quote / parenthesis decoration, not words."""
+    return _DECOR_RE.sub("", str(s))
+
+
+def _numbers_in(s: str) -> list[float]:
+    out = []
+    for m in _NUM_RE.finditer(str(s).translate(_DIGITS)):
+        tok = m.group()
+        if "," in tok and re.fullmatch(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", tok):
+            tok = tok.replace(",", "")      # thousands separator, not a list
+        try:
+            out.append(float(tok))
+        except ValueError:
+            pass
+    return out
+
+
+def _value_anywhere(got: str, want: str) -> bool:
+    """Whole-reply version of 'delivered': does the reply contain `want` as a
+    whole word, anywhere?  Used by `exact`, whose contract is the entire reply —
+    a preamble there is a strict fail, but the value was still produced."""
+    text = _undecorate(got).lower()
+    return any(re.search(r"(?<![\w.])" + re.escape(w.lower()) + r"(?![\w.])", text)
+               for w in [str(want).strip()] if w)
+
+
+def _value_present(got: str, want: str, numeric: bool = False) -> bool:
+    """Is `want` delivered at the front of `got`, ignoring decoration and prose
+    lead-ins?  A formatting-tolerance signal only: it can say content_ok for a
+    wrong-but-well-formed sentence ('A is the knave'), which is why the strict
+    `passed` verdict — not this — is what scores the run.
+
+    Deliberately narrow: the value has to appear as a whole word (or, for
+    numbers, as a whole number token), so 'no' does not hide inside 'not only'
+    and 12 does not hide inside 112."""
+    parts = [p.strip() for p in str(want).split(",") if p.strip()]
+    if not parts:
+        return False
+    text = _undecorate(got).strip()
+    if numeric:
+        w = _num(str(want))
+        return w is not None and any(math.isclose(n, w, rel_tol=1e-6, abs_tol=1e-9)
+                                    for n in _numbers_in(text))
+    if len(parts) > 1:            # ordered lists: 'A1B2, C3D4, E5F6'
+        low = text.lower()
+        pos = 0
+        for p in parts:
+            m = re.search(r"(?<![\w.])" + re.escape(p.lower()) + r"(?![\w.])", low[pos:])
+            if not m:
+                return False
+            pos += m.end()
+        return True
+    want_l = parts[0].lower()
+    leadin = re.sub(r"^\s*(?:the\s+)?(?:final\s+|correct\s+)?(?:answer|result)\s*(?:is|:)?\s*"
+                    r"|^\s*(?:it|that|so|therefore)\s+(?:is|must\s+be|would\s+be)\s+",
+                    "", text, flags=re.I).strip()
+    for cand in (text, leadin):
+        if re.match(re.escape(want_l) + r"(?![\w.])", cand.lower()):
+            return True
+    return False
+
+
 def check_answer(ctx: dict, spec: dict) -> dict:
     """ANSWER: contract with optional numeric equivalence."""
     got = extract_answer(ctx["response"])
@@ -559,7 +640,8 @@ def check_answer(ctx: dict, spec: dict) -> dict:
     if want is None:
         return {"passed": False, "expected": None, "actual": got[:200],
                 "detail": "no expected value"}
-    if spec.get("numeric"):
+    numeric = bool(spec.get("numeric"))
+    if numeric:
         a, b = _num(got), _num(str(want))
         if a is None or b is None:
             ok = got.lower() == str(want).lower()
@@ -569,7 +651,8 @@ def check_answer(ctx: dict, spec: dict) -> dict:
         ok = _norm(_strip_end_punct(got)) == _norm(_strip_end_punct(str(want)))
     else:
         ok = (_strip_end_punct(got).lower() == _strip_end_punct(str(want)).lower())
-    return {"passed": ok, "expected": want, "actual": got[:200]}
+    return {"passed": ok, "expected": want, "actual": got[:200],
+            "content_ok": ok or _value_present(got, str(want), numeric)}
 
 
 def check_math(ctx: dict, spec: dict) -> dict:
@@ -907,9 +990,30 @@ def check_toolcall(ctx: dict, spec: dict) -> dict:
                                  "numeric": spec.get("numeric"),
                                  "compact": spec.get("compact")})
         checks.append({"check": "answer", "passed": sub["passed"],
+                       "content_ok": sub["content_ok"],
                        "expected": sub["expected"], "actual": sub["actual"]})
-    return {"passed": all(c["passed"] for c in checks), "checks": checks,
-            "calls": [{"name": c["name"], "args": c["args"]} for c in calls]}
+    out = {"passed": all(c["passed"] for c in checks), "checks": checks,
+           "calls": [{"name": c["name"], "args": c["args"]} for c in calls]}
+    if "answer" in spec:
+        # a tool task can deliver the value while failing the call contract
+        out["content_ok"] = all(c.get("content_ok", c["passed"]) for c in checks)
+    return out
+
+
+def _walk(moves: str, grid: list[str], start):
+    """Follow a move string: returns (final_pos, None) or (None, why it broke)."""
+    deltas = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
+    r, c = start
+    for i, mv in enumerate(moves):
+        if mv not in deltas:
+            return None, f"move {i + 1} ({mv}) is not U/D/L/R"
+        r += deltas[mv][0]
+        c += deltas[mv][1]
+        if not (0 <= r < len(grid) and 0 <= c < len(grid[0])):
+            return None, f"move {i + 1} ({mv}) leaves the grid"
+        if grid[r][c] == "#":
+            return None, f"move {i + 1} ({mv}) hits a wall"
+    return (r, c), None
 
 
 def check_gridpath(ctx: dict, spec: dict) -> dict:
@@ -923,27 +1027,21 @@ def check_gridpath(ctx: dict, spec: dict) -> dict:
                 start = (r, c)
             if ch == "G":
                 goal = (r, c)
+    # content_ok asks the other question: is a correct path present anywhere in
+    # the answer, even dressed up ("**DRRRU**", "DRRRU (8 moves)")?
+    content_ok = any(_walk(run, grid, start)[0] == goal and len(run) == expect_len
+                     for run in set(re.findall(r"[UDLR]+", _undecorate(got))))
     if not re.fullmatch(r"[UDLR]+", got):
         return {"passed": False, "expected": f"{expect_len} moves",
-                "actual": got[:60], "detail": "not a pure U/D/L/R move string"}
-    r, c = start
-    deltas = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
-    bad = None
-    for i, mv in enumerate(got):
-        r += deltas[mv][0]
-        c += deltas[mv][1]
-        if not (0 <= r < len(grid) and 0 <= c < len(grid[0])):
-            bad = f"move {i + 1} ({mv}) leaves the grid"
-            break
-        if grid[r][c] == "#":
-            bad = f"move {i + 1} ({mv}) hits a wall"
-            break
+                "actual": got[:60], "detail": "not a pure U/D/L/R move string",
+                "content_ok": content_ok}
+    pos, bad = _walk(got, grid, start)
     if bad:
         return {"passed": False, "expected": f"{expect_len} moves",
-                "actual": got[:60], "detail": bad}
-    return {"passed": (r, c) == goal and len(got) == expect_len,
+                "actual": got[:60], "detail": bad, "content_ok": content_ok}
+    return {"passed": pos == goal and len(got) == expect_len,
             "expected": f"{expect_len} moves ending at G",
-            "actual": f"{got} ({len(got)} moves)"}
+            "actual": f"{got} ({len(got)} moves)", "content_ok": content_ok}
 
 
 VERIFIERS: dict[str, Callable[[dict, dict], dict]] = {
@@ -963,6 +1061,16 @@ VERIFIERS: dict[str, Callable[[dict, dict], dict]] = {
 # backend: direct OpenAI-compatible API (ground-truth metrics)
 # ---------------------------------------------------------------------------
 
+def retryable_status(status: int) -> bool:
+    """Is an HTTP error status worth another attempt?
+
+    A 4xx other than the transient ones is a deterministic rejection of THIS
+    request body (unsupported parameter, bad model id, context too long), so
+    retrying only re-uploads it and wastes an equal amount of server work.
+    Statuses alone — no engine-specific message parsing."""
+    return status in (408, 425, 429) or status >= 500
+
+
 @dataclass
 class ChatResult:
     text: str = ""
@@ -978,6 +1086,7 @@ class ChatResult:
     reasoning_chunks: int = 0    # ~reasoning tokens
     tool_calls: list = field(default_factory=list)  # [{id, name, args}]
     error: Optional[str] = None
+    retryable: bool = True       # False = deterministic client-side rejection
     raw_last: Optional[dict] = None
 
 
@@ -985,7 +1094,7 @@ class ApiBackend:
     name = "api"
 
     def __init__(self, endpoint: str, model: str, api_key: str = "llmbench",
-                 max_tokens: int = 4096, temperature: float = 0.0,
+                 max_tokens: int = 4096, temperature: Optional[float] = None,
                  timeout: float = 600.0):
         self.endpoint = endpoint.rstrip("/")
         self.model = model
@@ -994,17 +1103,32 @@ class ApiBackend:
         self.temperature = temperature
         self.timeout = timeout
 
-    def chat(self, messages: list[dict], tools: Optional[list] = None) -> ChatResult:
+    def request_body(self, messages: list[dict],
+                     tools: Optional[list] = None) -> dict:
+        """The OpenAI-compatible chat body. Engine-agnostic on purpose: only
+        fields in the chat-completions schema are ever sent."""
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        # temperature is OMITTED when unset (never sent as null): an absent
+        # parameter means "use what the endpoint has configured for this
+        # model", which is engine-agnostic. Endpoints that reject sampling
+        # overrides outright (OpenAI-style reasoning models answer
+        # "Unsupported parameter: 'temperature'") are only benchmarkable
+        # when the key is absent. Pass --temperature 0 to keep greedy
+        # decoding, which is what the recorded baselines used.
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
         if tools:
             body["tools"] = tools
+        return body
+
+    def chat(self, messages: list[dict], tools: Optional[list] = None) -> ChatResult:
+        body = self.request_body(messages, tools)
 
         scheme, _, rest = self.endpoint.partition("://")
         if scheme not in ("http", "https") or not rest:
@@ -1021,6 +1145,7 @@ class ApiBackend:
 
         res = ChatResult()
         t0 = time.monotonic()
+        deadline = t0 + self.timeout
         done = False  # stream completed with [DONE]
         try:
             conn.request("POST", req_path, body=req_body, headers=headers)
@@ -1028,13 +1153,25 @@ class ApiBackend:
             if resp.status != 200:
                 err = resp.read(4000).decode(errors="replace")
                 res.error = f"HTTP {resp.status}: {err[:500]}"
+                res.retryable = retryable_status(resp.status)
                 res.total_s = time.monotonic() - t0
                 return res
 
             buf = b""
             tc_acc: dict[int, dict] = {}
             while True:
-                chunk = resp.read(1024)
+                # real per-task wall limit: the socket timeout alone only
+                # bounds one idle read, so a stream trickling bytes could run
+                # unbounded. Re-arm the timeout for the time that is left, and
+                # read with read1() (at most one syscall) so the deadline is
+                # re-checked as soon as any bytes arrive, not after a buffer
+                # has been filled.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{self.timeout:.0f}s limit reached")
+                if conn.sock is not None:
+                    conn.sock.settimeout(min(self.timeout, remaining))
+                chunk = resp.read1(65536)
                 if not chunk:
                     break
                 buf += chunk
@@ -1070,6 +1207,8 @@ class ApiBackend:
         except Exception as e:  # noqa: BLE001
             if done:
                 pass  # stream completed; a late local failure is harmless
+            elif isinstance(e, TimeoutError):
+                res.error = f"timeout after {self.timeout:.0f}s"
             elif not res.text and not res.tool_calls:
                 res.error = f"{type(e).__name__}: {e}"
             else:
@@ -1152,7 +1291,8 @@ class ApiBackend:
             prompt_tokens=r.prompt_tokens, completion_tokens=r.completion_tokens,
             total_tokens=r.total_tokens, token_source=token_source,
             finish_reason=r.finish_reason, error=r.error, tool_calls=r.tool_calls,
-            content_chunks=r.content_chunks, reasoning_chunks=r.reasoning_chunks)
+            content_chunks=r.content_chunks, reasoning_chunks=r.reasoning_chunks,
+            retryable=r.retryable)
         return o
 
 
@@ -1185,6 +1325,7 @@ class TaskOutcome:
     events: list = field(default_factory=list)  # compact event summaries (CLI)
     content_chunks: Optional[int] = None
     reasoning_chunks: Optional[int] = None
+    retryable: bool = True      # False: retrying this task cannot help
 
 
 class CliBackend:
@@ -1653,7 +1794,10 @@ class PiBackend(CliBackend):
         # preserve_thinking: true}); default (unset) keeps the wire exactly
         # as before the flag existed.
         model_entry = {"id": cfg.model,
-                       "contextWindow": 262144,
+                       # honor a declared window so pi compacts like the
+                       # endpoint actually allows; 262144 is the historical
+                       # assumption for the reference deployment
+                       "contextWindow": cfg.context_tokens or 262144,
                        "maxTokens": cfg.max_tokens}
         if cfg.pi_thinking:
             model_entry["reasoning"] = True
@@ -2477,8 +2621,10 @@ MULLANG_TASKS: list[dict] = [
 ]
 
 # --- longctx (opt-in — excluded from default runs; api + pi, stdin for >96k) ---
-# CLI backends take the prompt as a process argument (Linux MAX_ARG_STRLEN is
-# 128 KiB per argument), so 128k-token prompts cannot be delivered that way.
+# Sizes are nominal PROMPT TOKENS, screened against --context-tokens before
+# they are sent (see `context_shortfall`). CLI backends take the prompt as a
+# process argument (Linux MAX_ARG_STRLEN is 128 KiB per argument), so the two
+# heaviest tiers can only run on api + pi (where they ride stdin).
 
 def _filler_log(seed: int, n_chars: int) -> str:
     """Deterministic machine-log filler of ~n_chars characters."""
@@ -2511,21 +2657,37 @@ def _needle_doc(seed: int, n_chars: int, codes: list[str],
     return "\n".join(lines)
 
 
+def _min_context_tokens(prompt: str) -> int:
+    """Conservative prompt size for context gating (NOT the token accounting
+    estimate in `_est_tokens`, which stays ~4 chars/token for history).
+    Measured on this suite's filler: 3.82 chars/token on the served
+    Qwen3.8 model (run.json usage), 3.94 on the Qwen3 tokenizer, 4.7 on
+    o200k — so dividing by 3.8 with a 2 % margin over-states the prompt for
+    every tokenizer we measured and under-runs no window."""
+    return int(len(prompt) / 3.8 * 1.02) + 1
+
+
 def _longctx(id: str, seed: int, n_chars: int, codes: list[str],
              positions: list[float], question: str, expected: str) -> dict:
     doc = _needle_doc(seed, n_chars, codes, positions)
     prompt = (f"Below is a long machine log.\n\n{doc}\n\n{question}\n"
               + CONTRACT)
+    # `min_context_tokens` = prompt footprint only; the runner adds the
+    # --max-tokens output reservation when it gates a task against
+    # --context-tokens (a served window must hold both).
     return task(id, prompt,
-                {"type": "answer", "value": expected, "compact": True})
+                {"type": "answer", "value": expected, "compact": True},
+                min_context_tokens=_min_context_tokens(prompt))
 
 
 LONGCTX_TASKS: list[dict] = [
+    # ~16k-token-window tier
     _longctx("longctx/needle-8k", seed=101, n_chars=32_000,
              codes=["QX4V"], positions=[0.50],
              question="The log contains exactly one line of the form "
                       "'MAGIC CODE: <code>'. What is the magic code?",
              expected="QX4V"),
+    # ~40k-token-window tier (3 needles, order-sensitive)
     _longctx("longctx/multi-32k", seed=202, n_chars=128_000,
              codes=["A1B2", "C3D4", "E5F6"], positions=[0.25, 0.50, 0.75],
              question="The log contains exactly three lines of the form "
@@ -2533,7 +2695,11 @@ LONGCTX_TASKS: list[dict] = [
                       "they appear, separated by commas (e.g. 'AB12, CD34, "
                       "EF56').",
              expected="A1B2, C3D4, E5F6"),
-    _longctx("longctx/needle-128k", seed=303, n_chars=512_000,
+    # 128k-token-window tier: ~120k prompt tokens + the default 4096-token
+    # output budget = ~124k, so it runs on 128000- and 131072-token models.
+    # (512k chars ≈ 134k prompt tokens on the served tokenizer — that overshot
+    # every 128k window and could only ever return a context-length error.)
+    _longctx("longctx/needle-128k", seed=303, n_chars=448_000,
              codes=["M3R9"], positions=[0.50],
              question="The log contains exactly one line of the form "
                       "'MAGIC CODE: <code>'. What is the magic code?",
@@ -2576,7 +2742,7 @@ class RunConfig:
     tasks: list[str]
     repeat: int
     max_tokens: int
-    temperature: float
+    temperature: Optional[float]  # None = omit the parameter (endpoint default)
     timeout: float
     sample_interval: float
     retries: int
@@ -2587,6 +2753,7 @@ class RunConfig:
     codex_provider: str
     pi_tools: str = ""  # --pi-tools pin; "" = pi's default toolset
     pi_thinking: str = ""  # --pi-thinking level; "" = pi/model default
+    context_tokens: int = 0  # served window; 0 = unknown (no heavy-task gating)
 
     @property
     def out_id(self) -> str:
@@ -2594,9 +2761,43 @@ class RunConfig:
         return f"{stamp}_{self.model}_{self.backend}"
 
 
-def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int]:
+# pi puts its own system prompt + tool schemas ahead of the task prompt;
+# measured on the recorded baseline (results/20261014-144304, needle-8k):
+# 11,645 prompt tokens vs 8,531 for the same task on api — ~3.1k of scaffolding.
+# That number is in Qwen3.8 tokens; a denser tokenizer (gpt-oss measured at
+# 4.4-4.7 chars/token on this suite's filler) charges less for the same text,
+# so this reservation is deliberately on the generous side.
+_PI_SCAFFOLD_TOKENS = 3200
+
+
+def context_need(cfg: RunConfig, t: dict) -> dict:
+    """The budget a size-screened task consumes, as the gate sees it, or {} when
+    the task is not screened (no declared window, or a task that publishes no
+    `min_context_tokens`). Components are additive so a skip can explain itself.
+
+    The engine-agnostic half of this: the harness never sniffs an engine's
+    private fields or error strings — the caller declares the window, and the
+    prompt estimate comes from `_min_context_tokens`. Sending a task that
+    cannot fit only buys a deterministic 4xx plus a wasted request."""
+    if cfg.context_tokens <= 0 or not t.get("min_context_tokens"):
+        return {}
+    prompt_est = t["min_context_tokens"]
+    scaffold = _PI_SCAFFOLD_TOKENS if cfg.backend == "pi" else 0
+    need = prompt_est + cfg.max_tokens + scaffold
+    return {"prompt_est": prompt_est, "max_tokens": cfg.max_tokens,
+            "scaffold_est": scaffold, "need": need,
+            "declared_context": cfg.context_tokens,
+            "shortfall": max(0, need - cfg.context_tokens)}
+
+
+def context_shortfall(cfg: RunConfig, t: dict) -> int:
+    return context_need(cfg, t).get("shortfall", 0)
+
+
+def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int, list[dict]]:
     out: list[dict] = []
     skipped = 0
+    too_large: list[dict] = []
     if cfg.suites:
         active = set(cfg.suites)
     elif cfg.tasks:
@@ -2614,8 +2815,13 @@ def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int]:
             if t.get("backends") and cfg.backend not in t["backends"]:
                 skipped += 1
                 continue
+            if context_shortfall(cfg, t):
+                d = context_need(cfg, t)
+                d["id"] = t["id"]
+                too_large.append(d)
+                continue
             out.append(t)
-    return out, skipped
+    return out, skipped, too_large
 
 
 def console_line(r: dict) -> str:
@@ -2633,6 +2839,8 @@ def console_line(r: dict) -> str:
         parts.append(f"(p {r['prompt_tokens']} / c {r.get('completion_tokens')})")
     if r.get("verdict") and r["verdict"].get("expected") is not None:
         parts.append(f"[want {str(r['verdict']['expected'])[:24]} got {str(r['verdict']['actual'])[:24]}]")
+    if r.get("verdict") and r["verdict"].get("content_ok") and not r["verdict"].get("passed"):
+        parts.append("VALUE DELIVERED (form off)")
     if r.get("error"):
         parts.append(f"ERR {r['error'][:80]}")
     return "  ".join(parts)
@@ -2698,9 +2906,17 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
 
     endpoint_preflight(cfg, log)
     backend = build_backend(cfg)
-    tasks, skipped = selected_tasks(cfg)
+    tasks, skipped, too_large = selected_tasks(cfg)
     if skipped:
         log(f"[llmbench] {skipped} task(s) skipped (backend '{cfg.backend}' not supported)")
+    if too_large:
+        log(f"[llmbench] {len(too_large)} task(s) skipped (do not fit the declared "
+            f"--context-tokens {cfg.context_tokens}):")
+        for d in too_large:
+            log(f"             {d['id']}: prompt est ~{d['prompt_est']:,}"
+                + (f" + pi scaffold est ~{d['scaffold_est']:,}" if d['scaffold_est'] else "")
+                + f" + --max-tokens {d['max_tokens']:,} = {d['need']:,} tokens"
+                f"  (> {d['declared_context']:,} declared, short by {d['shortfall']:,})")
     if not cfg.suites and DEFAULT_EXCLUDE:
         log(f"[llmbench] default run excludes heavy suite(s) "
             f"{sorted(DEFAULT_EXCLUDE)} — select explicitly with --suites")
@@ -2718,12 +2934,14 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             "task_filter": cfg.tasks,
             "repeat": cfg.repeat, "max_tokens": cfg.max_tokens,
             "temperature": cfg.temperature, "timeout_s": cfg.timeout,
+            "context_tokens": cfg.context_tokens,
             "retries": cfg.retries, "concurrency": cfg.concurrency,
             "sample_interval_s": cfg.sample_interval, "warmup": cfg.warmup,
             "dsh_api_key_env": cfg.dsh_api_key_env,
             "codex_provider": cfg.codex_provider,
             "pi_tools": cfg.pi_tools,
             "pi_thinking": cfg.pi_thinking,
+            "context_skipped": too_large,
         },
         "host": host_facts(),
         "metrics_legend": {
@@ -2750,6 +2968,25 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
                        "reports no usage). completion_tokens includes reasoning tokens"),
             "resources": ("sampled at --sample-interval; chip stats are avg/min/peak/p50/p95; "
                            "proc_cpu_pct/proc_rss_mb cover the CLI process tree on cli backends"),
+            "status": ("pass/fail = a scored verdict; error = the task never produced a "
+                       "verdict (transport, timeout, crash, endpoint rejection). An empty "
+                       "response is never a pass: reasoning-without-answer is a fail, a "
+                       "totally empty one is an error"),
+            "content_ok": ("per-verdict, alongside the strict `passed`: the expected "
+                           "value was delivered even though it was decorated (markdown, "
+                           "units, prose) — for ANSWER-line tasks it must lead the line, "
+                           "for whole-reply tasks it must appear as a whole word. totals: "
+                           "n_content / content_rate per suite. Only answer-shaped "
+                           "verifiers split the two; constraint, unittest, file and "
+                           "tool-contract verdicts mirror `passed`"),
+            "truncated": "true when the server stopped with finish_reason=length (output budget hit; completion_tokens includes reasoning)",
+            "retryable": ("false for a deterministic HTTP 4xx rejection (unsupported "
+                          "parameter, context too long): --retries does not replay it. "
+                          "config.context_skipped lists tasks screened out beforehand by "
+                          "--context-tokens, with the arithmetic behind the skip "
+                          "(prompt_est + scaffold_est + max_tokens = need vs the "
+                          "declared window); the estimates are worst-case — see "
+                          "_min_context_tokens)"),
         },
         "tasks": [],
         "totals": {},
@@ -2764,12 +3001,20 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
         time.sleep(0.5)
 
     def _one(t: dict, rep: int) -> dict:
-        """Run one task, retrying only hard errors (a 'fail' is a real verdict)."""
+        """Run one task, retrying only hard errors (a 'fail' is a real verdict).
+
+        A deterministic client-side rejection (HTTP 4xx other than 408/425/429)
+        is NOT retried: the same body fails the same way, and for a heavy prompt
+        that is a wasted multi-hundred-kilobyte re-upload per attempt."""
         r = None
         attempt = 0
         for attempt in range(cfg.retries + 1):
             r = run_one_task(cfg, t, backend, prober, out_dir, rep, log)
             if r["status"] != "error":
+                break
+            if r.get("retryable") is False:
+                log(f"[llmbench] {t['id']} rejected by the endpoint, not retrying: "
+                    f"{(r.get('error') or '')[:100]}")
                 break
             if attempt < cfg.retries:
                 log(f"[llmbench] retry {attempt + 1}/{cfg.retries} for {t['id']}: "
@@ -2852,6 +3097,8 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
         "reasoning_chunks": result.reasoning_chunks,
         "tool_calls": result.tool_calls,
         "error": result.error,
+        "retryable": result.retryable,
+        "truncated": result.finish_reason == "length",
         "decode_tps": None,
         "gen_tps": None,
         "overall_tps": None,
@@ -2879,7 +3126,12 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
         res["overall_tps"] = round(result.completion_tokens / result.total_s, 2)
 
     # verdict
-    if not result.error and (result.text or result.tool_calls):
+    # `file` / `run` / `code` verifiers score the workspace (a created file, a
+    # re-run test suite, a written solution.py) and not only the reply — an
+    # agent that did the work but said nothing still deserves a real verdict
+    # instead of a silent no-verdict pass.
+    workspace_verifier = t["verify"]["type"] in ("file", "run", "code")
+    if not result.error and (result.text or result.tool_calls or workspace_verifier):
         try:
             verifier = VERIFIERS.get(t["verify"]["type"])
             if verifier is None:
@@ -2890,11 +3142,36 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
                        "task_id": rid, "out_dir": out_dir, "scratch": scratch}
                 res["verdict"] = verifier(ctx, t["verify"])
                 res["status"] = "pass" if res["verdict"]["passed"] else "fail"
+                # verifiers that compare a delivered value report both readings;
+                # the rest (constraints, unittests, tool contracts) have no
+                # content/form split, so content mirrors the strict verdict
+                res["verdict"].setdefault("content_ok", res["verdict"]["passed"])
         except Exception as e:  # noqa: BLE001 — a verifier bug is not a model
             # verdict: record it, retry, and keep the run alive
             res["status"] = "error"
             res["error"] = (f"verifier {t['verify']['type']} crashed: "
                              f"{type(e).__name__}: {e}")
+    elif not result.error:
+        # Nothing came back although the call "succeeded", and the verifier
+        # needed a reply. Neither shape may be left as a silent no-verdict
+        # pass (the status default is `pass`):
+        #  - reasoning streamed but no answer (output budget exhausted while
+        #    thinking) — a real model verdict, so a fail;
+        #  - truly empty (no message at all) — an endpoint fault, so an error
+        #    worth one retry.
+        if result.reasoning or (result.reasoning_chunks or 0) > 0:
+            res["status"] = "fail"
+            res["verdict"] = {
+                "passed": False,
+                "detail": ("reasoning but no content — output budget exhausted "
+                           f"before the answer (finish_reason="
+                           f"{result.finish_reason or 'n/a'}, "
+                           f"reasoning_chunks={result.reasoning_chunks}); "
+                           "raise --max-tokens")}
+        else:
+            res["status"] = "error"
+            res["error"] = (f"empty response (finish_reason="
+                            f"{result.finish_reason or 'n/a'})")
 
     res["resources"] = aggregate_resources(
         sampler.samples,
@@ -2905,9 +3182,12 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
     os.makedirs(task_dir, exist_ok=True)
     try:
         r3 = lambda v: round(v, 3) if isinstance(v, (int, float)) else v  # noqa: E731
+        vd = res.get("verdict") or {}
+        status_note = ("  (value delivered, answer line not exact)"
+                       if vd.get("content_ok") and not vd.get("passed") else "")
         with open(os.path.join(task_dir, f"{task_key}.md"), "w") as f:
             f.write(f"# {rid}\n\n- suite: {t['suite']}\n- backend: {cfg.backend}\n"
-                    f"- status: {res['status']}\n"
+                    f"- status: {res['status']}{status_note}\n"
                     f"- ttft: {r3(res['ttft_s'])}s (first reasoning: "
                     f"{r3(res.get('ttft_first_reasoning_s'))}s)  total: {res['total_s']}s\n"
                     f"- gen: {res.get('gen_tps')} tok/s  decode(content): "
@@ -2961,9 +3241,17 @@ def compute_totals(task_results: list[dict]) -> dict:
             "n": len(rs),
             "passed": sum(1 for r in scored if r["verdict"].get("passed")),
             "failed": sum(1 for r in scored if not r["verdict"].get("passed")),
+            # strict pass + "the value was delivered regardless of formatting"
+            "content": sum(1 for r in scored
+                           if r["verdict"].get("content_ok", r["verdict"].get("passed"))),
             "errors": sum(1 for r in rs if r.get("error")),
             "pass_rate": round(sum(1 for r in scored if r["verdict"].get("passed"))
                               / len(scored), 3) if scored else None,
+            "content_rate": round(sum(1 for r in scored
+                                      if r["verdict"].get(
+                                          "content_ok",
+                                          r["verdict"].get("passed")))
+                                 / len(scored), 3) if scored else None,
             "ttft_s": stats([r["ttft_s"] for r in rs]),
             "ttft_s_ci95": stats_ci95([r["ttft_s"] for r in rs]),
             "ttft_model_s": stats([r.get("ttft_model_s") for r in rs]),
@@ -3000,6 +3288,9 @@ def compute_totals(task_results: list[dict]) -> dict:
         "n_pass": sum(1 for r in task_results if r.get("status") == "pass"),
         "n_fail": sum(1 for r in task_results if r.get("status") == "fail"),
         "n_error": sum(1 for r in task_results if r.get("error")),
+        "n_content": sum(1 for r in task_results if r.get("verdict") and
+                         r["verdict"].get("content_ok",
+                                         r["verdict"].get("passed"))),
         "suites": suites_out,
         "ttft_s": stats([r["ttft_s"] for r in ok]),
         "ttft_s_ci95": stats_ci95([r["ttft_s"] for r in ok]),
@@ -3045,23 +3336,44 @@ def _ttft_reasoning_stats(run: dict) -> dict:
     return stats([t.get("ttft_first_reasoning_s") for t in run["tasks"]])
 
 
+def _temp_label(v) -> str:
+    """Temperature as the report reads it: a number (sent to the endpoint)
+    or 'endpoint default' (parameter omitted)."""
+    return "endpoint default (param omitted)" if v is None else str(v)
+
+
 def render_report_md(run: dict) -> str:
     cfg, tot = run["config"], run["totals"]
     L: list[str] = []
     L.append(f"# llmbench report — {cfg['model']} via {cfg['backend']}\n")
     L.append(f"- started: {run['started_at']}  ·  finished: {run.get('finished_at')}")
     L.append(f"- endpoint: `{cfg['endpoint']}`  ·  repeat: {cfg['repeat']}  "
-             f"·  max_tokens: {cfg['max_tokens']}  ·  temperature: {cfg['temperature']}")
+             f"·  max_tokens: {cfg['max_tokens']}  ·  "
+             f"temperature: {_temp_label(cfg['temperature'])}")
+    if cfg.get("context_tokens"):
+        L.append(f"- declared context window: {cfg['context_tokens']:,} tokens"
+                 + (f"  ·  screened out for size: "
+                    + ", ".join(f"{d['id']} (needs {d['need']:,} tokens)"
+                                for d in cfg["context_skipped"])
+                    if cfg.get("context_skipped") else ""))
     h = run["host"]
     L.append(f"- host: {h.get('hostname')} · {h.get('arch')} · {h.get('cpu_cores')} cores "
              f"· {h.get('ram_total_gb')} GB RAM · accel: {h.get('accelerator')}\n")
 
     L.append("## Scorecard\n")
-    L.append("| suite | tasks | passed | failed | errors | pass rate |")
-    L.append("|---|---|---|---|---|---|")
+    L.append("| suite | tasks | passed | failed | errors | pass rate | content |")
+    L.append("|---|---|---|---|---|---|---|")
     for suite, s in sorted(tot["suites"].items()):
+        pr = fnum(s["pass_rate"] * 100, 1) + "%" if s["pass_rate"] is not None else "—"
+        cr = (fnum(s["content_rate"] * 100, 1) + "%"
+              if s.get("content_rate") is not None else "—")
         L.append(f"| {suite} | {s['n']} | {s['passed']} | {s['failed']} | {s['errors']} "
-                 f"| {fnum(s['pass_rate'] * 100, 1) if s['pass_rate'] is not None else '—'}% |")
+                 f"| {pr} | {cr} |")
+    if tot.get("n_content") is not None and tot["n_content"] != tot.get("n_pass"):
+        L.append(f"\n`passed` is the strict contract verdict. `content` counts tasks where the "
+                 f"expected value was actually delivered (ignoring markdown, units or prose "
+                 f"around it) — the gap between {tot['n_pass']}/{tot['n_tasks']} and "
+                 f"{tot['n_content']}/{tot['n_tasks']} is formatting, not wrong answers.")
     L.append("")
 
     def statline(name: str, d: dict, unit: str) -> str:
@@ -3134,10 +3446,15 @@ def console_summary(run: dict, log: Callable[[str], None] = print) -> None:
     tot = run["totals"]
     log("\n[llmbench] === summary ===")
     log(f"tasks: {tot['n_tasks']}  pass: {tot['n_pass']}  fail: {tot['n_fail']}  "
-        f"error: {tot['n_error']}")
+        f"error: {tot['n_error']}"
+        + (f"  ·  content: {tot['n_content']}/{tot['n_tasks']}"
+           if tot.get("n_content") is not None
+           and tot["n_content"] != tot["n_pass"] else ""))
     for suite, s in sorted(tot["suites"].items()):
         pr = fnum(s["pass_rate"] * 100, 1) if s["pass_rate"] is not None else "—"
-        log(f"  {suite:<14} {s['passed']}/{s['n']} pass ({pr}%)  "
+        extra = (f" · content {s['content']}/{s['n']}"
+                 if s["content"] != s["passed"] else "")
+        log(f"  {suite:<14} {s['passed']}/{s['n']} pass ({pr}%){extra}  "
             f"ttft avg {_fmt_ci(s['ttft_s'].get('avg'), s.get('ttft_s_ci95'))}s  "
             f"total avg {_fmt_ci(s['total_s'].get('avg'), s.get('total_s_ci95'))}s  "
             f"gen {_fmt_ci(s['gen_tps'].get('avg'), s.get('gen_tps_ci95'))} tok/s "
@@ -3171,6 +3488,15 @@ def cmd_sample(args: argparse.Namespace) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _env_int(name: str, fallback: int) -> int:
+    """Integer env default that degrades to the fallback instead of raising:
+    a typo in LLMBENCH_CONTEXT_TOKENS must not break every subcommand."""
+    try:
+        return int(os.environ.get(name, "") or fallback)
+    except ValueError:
+        return fallback
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="llmbench",
@@ -3190,8 +3516,19 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--tasks", default="", help="comma-separated task ids (default: all)")
     pr.add_argument("--repeat", type=int, default=1)
     pr.add_argument("--max-tokens", type=int, default=4096)
-    pr.add_argument("--temperature", type=float, default=0.0)
+    pr.add_argument("--temperature", type=float, default=None,
+                    help="sampling temperature for the api backend; when the "
+                         "flag is omitted the parameter is not sent at all, so "
+                         "the endpoint's own configured value applies "
+                         "(pass 0 for greedy, as the recorded baselines used)")
     pr.add_argument("--timeout", type=float, default=600.0)
+    pr.add_argument("--context-tokens", type=int,
+                    default=_env_int("LLMBENCH_CONTEXT_TOKENS", 0),
+                    help="the served context window (prompt + output tokens); "
+                         "0 = unknown, send every task. When declared, tasks "
+                         "that cannot fit are skipped with a logged reason "
+                         "instead of drawing a context-length error (and the "
+                         "pi backend declares this window to pi)")
     pr.add_argument("--retries", type=int, default=1,
                    help="extra attempts for tasks that ERROR (not for genuine fails); "
                         "default 1")
@@ -3232,12 +3569,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_list(_: argparse.Namespace) -> None:
-    print(f"{'task id':<28} {'verifier':<12} {'backends':<26}")
+    print(f"{'task id':<28} {'verifier':<12} {'backends':<26} context (tokens)")
     for suite_name, tasks_ in SUITES.items():
         print(f"\n[{suite_name}]")
         for t in tasks_:
             bks = ",".join(t.get("backends", BACKENDS))
-            print(f"  {t['id']:<28} {t['verify']['type']:<12} {bks:<26}")
+            # heavy tasks publish their prompt footprint so a caller can gate
+            # them with --context-tokens (prompt + --max-tokens must fit)
+            need = t.get("min_context_tokens")
+            ctx = (f"prompt ~{need:,}, needs ≥{need + 4096:,} with the default "
+                   f"--max-tokens 4096" if need else "—")
+            print(f"  {t['id']:<28} {t['verify']['type']:<12} {bks:<26} {ctx}")
 
 
 def cmd_compare(args: argparse.Namespace) -> None:
@@ -3277,7 +3619,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
                 vals.append(f"0/{s['n']} (no verdicts)")
             else:
                 vals.append(f"{s['passed']}/{s['n']} "
-                            f"({s['pass_rate'] * 100:.1f}%)")
+                            f"({s['pass_rate'] * 100:.1f}%)"
+                            + (f" · content {s['content']}/{s['n']}"
+                               if s.get("content", s["passed"]) != s["passed"] else ""))
         row(suite, vals)
 
     def avgp95(run: dict, key: str) -> str:
@@ -3302,6 +3646,10 @@ def cmd_compare(args: argparse.Namespace) -> None:
     row("total tokens",
         [f"{run['totals']['total_tokens']} ({src(run)})" for _, run in runs])
     row("n tasks", [str(run["totals"]["n_tasks"]) for _, run in runs])
+    row("strict pass", [f"{run['totals']['n_pass']}/{run['totals']['n_tasks']}"
+                        for _, run in runs])
+    row("value delivered", [f"{run['totals'].get('n_content', run['totals']['n_pass'])}"
+                            f"/{run['totals']['n_tasks']}" for _, run in runs])
 
     L.append("")
     L.append("_TTFT-model excludes CLI startup (use for cross-backend model latency). "
@@ -3350,6 +3698,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         codex_provider=args.codex_provider,
         pi_tools=args.pi_tools,
         pi_thinking=args.pi_thinking,
+        context_tokens=args.context_tokens,
     )
     out_dir = os.path.join(args.out, cfg.out_id)
     os.makedirs(out_dir, exist_ok=True)

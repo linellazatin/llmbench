@@ -81,8 +81,9 @@ then covers its specifics and the differences.
 
 Current task inventory (59 tasks total): `smoke` 3 · `reasoning` 8 ·
 `spatial` 8 · `ifeval` 8 · `coding` 8 · `tools` 8 · `agentic` 5 ·
-`mullang` 8 · `longctx` 3 (opt-in). `list` prints them with verifiers and
-per-task backend gates.
+`mullang` 8 · `longctx` 3 (opt-in). `list` prints them with verifiers,
+per-task backend gates, and — for the heavy tiers — the context window they
+need.
 
 ### Shared `run` flags (all backends)
 
@@ -95,9 +96,10 @@ per-task backend gates.
 | `--suites` | comma-separated subset of `smoke,reasoning,spatial,ifeval,coding,tools,agentic,mullang,longctx` | all except `longctx` | gated tasks on a non-admitted backend are logged as skipped, not errors |
 | `--tasks` | comma-separated task ids (see `list`), e.g. `reasoning/knights-knaves,coding/caesar` | all in the selected suites | implies the tasks' suites — this is how `longctx` is reachable |
 | `--repeat` | int ≥ 1 | `1` | aggregates with ≥ 2 samples gain 95 % CIs (`*_ci95`) |
-| `--max-tokens` | int | `4096` | **effective on `api` and `pi` only** — the other CLIs have no output-budget knob wired |
-| `--temperature` | float | `0.0` | **effective on `api` only** |
-| `--timeout` | float, seconds | `600` | per-task wall limit; a timeout is an `error` (→ retried) |
+| `--max-tokens` | int | `4096` | **effective on `api` and `pi` only** — the other CLIs have no output-budget knob wired. Also the output reservation the `--context-tokens` gate adds to a heavy prompt |
+| `--temperature` | float | **unset** | **effective on `api` only.** Unset = the parameter is *omitted from the request*, so the endpoint's own configured sampling applies. Pass `--temperature 0` for greedy decoding (what the recorded baselines used). Endpoints that reject the key outright (OpenAI-style reasoning models) are only benchmarkable while it is unset |
+| `--timeout` | float, seconds | `600` | per-task wall limit on every backend (`api` re-arms the socket timeout so a slow-but-trickling stream is still cut; CLIs kill the process tree); a timeout is an `error` (→ retried) |
+| `--context-tokens` | int | `0` (= `$LLMBENCH_CONTEXT_TOKENS`, 0 = unknown) | the served window in tokens (prompt + output). When declared, tasks whose prompt + `--max-tokens` cannot fit are **skipped with a logged reason** instead of drawing a context-length error, and `pi` declares this window in its generated `models.json`. Estimates are worst-case (see the Context gating note): a skip line always shows its own arithmetic |
 | `--retries` | int ≥ 0 | `1` | extra attempts for tasks that **error** only — a verifier fail is a real verdict and is never retried |
 | `--concurrency` | int ≥ 1 | `1` | load mode: N tasks in flight, each keeping its own resource sampler; the shared endpoint is the load target — run backends sequentially, never in parallel |
 | `--sample-interval` | float, seconds | `2.0` | resource-sampling cadence during each task |
@@ -148,6 +150,7 @@ No CLI binary needed; streams `/chat/completions` directly.
 python3 llmbench.py run --backend api --suites smoke      # 3 tasks — sanity
 python3 llmbench.py run --backend api                    # 51 tasks (longctx opt-in; agentic is CLI-only)
 python3 llmbench.py run --backend api --suites longctx   # + the 3 heavy needle tasks
+python3 llmbench.py run --backend api --suites longctx --context-tokens 131072  # gate to the served window
 python3 llmbench.py run --backend api --tasks reasoning/knights-knaves,coding/caesar
 python3 llmbench.py run --backend api --max-tokens 1024 --temperature 0.2 --suites smoke
 ```
@@ -158,7 +161,7 @@ python3 llmbench.py run --backend api --max-tokens 1024 --temperature 0.2 --suit
 | backend-specific flags | — (none) |
 | reasoning | both delta field conventions captured — `reasoning` and `reasoning_content` (engines differ); lands in the task `.md` Reasoning section and sets `ttft_first_reasoning_s` |
 | suites | 8 of 9 (all except CLI-only `agentic`) — 54 admissible, 51 by default (longctx opt-in); the only backend for `tools`, reference for `longctx` |
-| shared flags effective | `--max-tokens` ✓, `--temperature` ✓ (the only backend for both) |
+| shared flags effective | `--max-tokens` ✓, `--temperature` ✓ when passed (the only backend for both; omitted from the request when the flag is unset), `--context-tokens` ✓ (screens over-sized tasks before sending) |
 | tokens / latency | server `usage` (final chunk); `ttft_s` = request → first content token — cleanest numbers, no harness overhead. If the engine reports no streamed usage, tokens fall back to the ~4 chars/token estimate (`token_source=estimate`, as on CLI backends) |
 
 ### dsh
@@ -179,7 +182,7 @@ python3 llmbench.py run --backend dsh --dsh-api-key-env MY_OTHER_KEY_ENV --suite
 | env set | `<--dsh-api-key-env>` = `--api-key` |
 | backend-specific flags | `--dsh-api-key-env <NAME>` — name of the env var dsh's per-run provider reads the key from; any non-empty string (default `MY_GATEWAY_API_KEY`) |
 | suites | 7 (all except `tools` [api-only] and `longctx` [argv size limit]) = 48 tasks |
-| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ (no knobs wired for this CLI) |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ (no knobs wired for this CLI), `--context-tokens` ✓ (selection gate only) |
 | tokens / latency | **estimated** (~4 chars/token of the prompt only, `token_source=estimate`) — dsh prints no usage; stdout-buffered (it *does* stream over the wire — SSE incl. thinking — but prints only the final message), so `ttft_model_s` = final message (TTFT ≈ total). True usage is measurable through the loopback usage-logging proxy `tools/usage_proxy.py` (+ `tools/dsh_usage_corr.py` for request→task correlation): measured 2026-10-14, run `results/20261014-160020_qwen3.8_dsh`, dsh's real cost is 778.6k total tokens / 48 tasks (~15.7k prompt/task — a ~170-token session-title call + ≥1 agent call with ~8.9k of dsh scaffolding each) |
 
 ### codex
@@ -199,7 +202,7 @@ python3 llmbench.py run --backend codex --codex-provider vllm
 | env set | `OPENAI_API_KEY` = `--api-key` |
 | backend-specific flags | `--codex-provider <NAME>` — the `model_providers` entry name; the harness sets its `base_url`/`name` inline via `-c`, so no pre-existing codex config entry is needed (any string; default `$LLMBENCH_CODEX_PROVIDER` or `vllm`) |
 | suites | 7 (same as dsh) = 48 tasks |
-| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗, `--context-tokens` ✓ (selection gate only) |
 | tokens / latency | server `usage` from `turn.completed` (cumulative over the task's turns); `ttft_model_s` = first `item.*` event; JSONL stream — events surface in the task `.md` `CLI events` section |
 
 ### claude
@@ -218,7 +221,7 @@ python3 llmbench.py run --backend claude --suites agentic
 | env set | `ANTHROPIC_BASE_URL` = `--endpoint` minus the trailing `/v1`; `ANTHROPIC_AUTH_TOKEN` = `ANTHROPIC_API_KEY` = `--api-key` |
 | backend-specific flags | — (none) |
 | suites | 7 (same as dsh) = 48 tasks |
-| shared flags effective | `--max-tokens` ✗, `--temperature` ✗ |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗, `--context-tokens` ✓ (selection gate only) |
 | tokens / latency | server `usage` from the `result` event; vLLM ≥ 0.23 serves the Anthropic `/v1/messages` protocol natively (no bridge) |
 | notes | per-task trust plumbing is automatic (scratch allowlist + temporary `~/.claude.json` entry, removed after the task) — see the Backends section |
 
@@ -238,10 +241,10 @@ python3 llmbench.py run --backend pi --pi-thinking off --suites smoke
 | item | value |
 |---|---|
 | invocation | `pi --mode json --no-session --provider llmbench --model <m> --api-key <k>` (`+ --append-system-prompt <sys>`, `--tools <list>`, `--thinking <level>` as applicable) `-- <prompt>`; prompts > 96 000 chars are piped via **stdin** instead of argv (Linux per-argument limit), system prompt travels inside that text |
-| per-run overlay | `PI_CODING_AGENT_DIR` = `<scratch>/.pi-agent` holding a self-contained `models.json` (provider `llmbench`, `api: openai-completions`, `maxTokens` mirroring `--max-tokens`) → `~/.pi/agent` is never touched, no trust prompt |
+| per-run overlay | `PI_CODING_AGENT_DIR` = `<scratch>/.pi-agent` holding a self-contained `models.json` (provider `llmbench`, `api: openai-completions`, `maxTokens` mirroring `--max-tokens`, `contextWindow` from `--context-tokens` or 262 144 when undeclared) → `~/.pi/agent` is never touched, no trust prompt |
 | backend-specific flags | `--pi-tools <list>` — pi's tool allowlist; entries are the built-in tool names `read,write,edit,bash,grep,find,ls` (glob patterns with `*` work; `+name`/`-name` add/remove against the default set; MCP tools stay enabled unless an entry starts with `mcp__`); default = pi's full default toolset. `--pi-thinking <level>` — `off`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`; on qwen-style vLLM models the level maps to `enable_thinking` (off = off, other = on); default = model default. Thinking text is captured in the task `.md` Reasoning section |
 | suites | 8 (all except api-only `tools`; includes `longctx`) = 51 tasks |
-| shared flags effective | `--max-tokens` ✓ (→ `maxTokens` in the generated `models.json`), `--temperature` ✗ |
+| shared flags effective | `--max-tokens` ✓ (→ `maxTokens` in the generated `models.json`), `--temperature` ✗, `--context-tokens` ✓ (selection gate, incl. pi's own scaffolding, and declared as pi's `contextWindow`) |
 | tokens / latency | server `usage` summed over the task's responses; `ttft_model_s` = first assistant event; fastest CLI observed, lowest prompt-token cost |
 
 After any run: artifacts land in the run dir (see the table in Quick start),
@@ -257,6 +260,20 @@ rule: backends sharing one endpoint run **sequentially** — never in parallel.
 - `decode_tps` — content chunks / (end − ttft) → content-only rate, `api` only (suppressed for windows < 250 ms)
 - `overall_tps` — completion tokens / total latency (incl. TTFT)
 - tokens — from server `usage` when the backend reports it (`token_source=server`: codex/claude/pi — cumulative over the task's internal API calls **including the harness system prompt**; api — the stream's usage chunk). Otherwise ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`, and `api` against engines with no streamed usage). `completion_tokens` **includes reasoning tokens**
+- **`passed` vs `content_ok`** — two readings of every scored task. `passed` is the
+  strict contract verdict (the answer line must *be* the value). `content_ok` answers a
+  different question: was the value delivered at all, ignoring markdown, quotes, a unit or
+  a prose lead-in — `ANSWER: **408**`, `ANSWER: 408 items`, `ANSWER: A is the knight` all
+  deliver. Only answer-shaped verifiers (`exact`, `answer`, `math`, `gridpath`, a tool
+  task's `answer`) split the two; constraint, unittest, file and post-run verdicts mirror
+  `passed` because their form *is* the content. Aggregates: `totals.n_content` and
+  `suites.<s>.content/content_rate`; the console summary and `report.md` show
+  `content` only where it exceeds the strict pass count (the `report.md` scorecard always
+  shows the column, so older runs render `—`), `compare` gets a
+  `value delivered` row, and a task `.md` says `(value delivered, answer line not exact)`.
+  Strict scoring is unchanged, so pre-0.2.0 baselines stay comparable.
+  `content_ok` is a formatting signal, never a correctness claim — `ANSWER: A is the
+  knave` reads as delivered
 
 The `api` backend is the reference for pure server metrics; CLI numbers include harness overhead. **Run backends sequentially when they share one endpoint** (e.g. this host's single vLLM) — parallel runs contend on the NPU and corrupt each other's latency/throughput.
 
@@ -294,11 +311,31 @@ opt-in `longctx` suite**, which you must name explicitly).
 | `tools` | 8 | OpenAI-style tool calls: correct function, argument subsets, arithmetic expressions safe-eval'd, multi-call, and a "don't over-call" task | tool-call matcher (api backend only) |
 | `agentic` | 5 | CLI-only: create a file with exact content, sum a data file, shell-compute, script-and-run word count, fix a failing unit test in a provided repo | file-content / `ANSWER:` math / post-task command re-run (dsh, codex, claude, pi) |
 | `mullang` | 8 | prompts in zh / ja / ko / ar / ru / de / es / hi — word problems, a grid path (ru), a 2-sentence constraint (de), a knights-&-knaves (es), exact word count in Devanagari (hi, `script` check) | existing verifiers (math / gridpath / constraints / answer) + script check |
-| `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log — nominal 8k / 32k (3 needles, order) / 128k tokens (32k/128k/512k chars of filler) | `ANSWER:` exact/ordered (api + pi; prompts over the CLI per-argument limit ride pi's stdin) |
+| `longctx` | 3 | opt-in: needle retrieval in a deterministic filler log. Sizes are token-based and published per task as `min_context_tokens`: `needle-8k` ~8.7k tok, `multi-32k` ~34.5k tok (3 needles, order), `needle-128k` ~120.3k tok — the heavy tier is deliberately under 128k so prompt + the default `--max-tokens 4096` still fits a 128k-token window | `ANSWER:` exact/ordered (api + pi; prompts over the CLI per-argument limit ride pi's stdin) |
 
 `python3 selftest.py` runs fast offline checks: the verifier self-tests plus
-characterization probes for the CLI backends (argv/env/overlay) and the api
-streaming parser (no model, no network).
+characterization probes for the CLI backends (argv/env/overlay), the api
+streaming parser and the strict/content verdict split (no model, no network).
+
+### What each suite actually scores
+
+Of the 59 tasks, 41 decide on the **reply text** and 18 on **behavior** — which is why
+decoding temperature moves a pass rate at all (counts come from the verifier types, not
+from the suite names):
+
+| verdict class | tasks | where | breaks when the model |
+|---|---|---|---|
+| value on the `ANSWER:` line (11 `answer` + 17 `math`) | 28 | smoke, reasoning, spatial, agentic, mullang, longctx | decorates or explains it → strict fail, `content_ok` pass |
+| move string (`gridpath`) | 2 | spatial (`grid-path`), mullang (`ru-grid`) | writes `up, up, right` instead of `UURR` |
+| whole-reply form (10 `constraints` + 1 `exact`) | 11 | ifeval (8), mullang (`de-constraints`, `hi-words`), `smoke/pong` | adds any prose: word/sentence/line counts, casing, banned chars, first line, JSON shape and the single-word reply all read the **entire** reply |
+| workspace behavior (8 `code` + 1 `file` + 1 `run`) | 10 | coding (8), agentic (`file-create`, `fix-bug`) | nothing — phrasing is irrelevant, only what the code/file does |
+| tool-call contract (`toolcall`) | 8 | tools | nothing textual — call name/args must match (a string arg is exact modulo case, so `Tokyo` ok, `Tokyo, Japan` not); `tools/no-call-needed` checks the answer line too |
+
+Practical consequence: **greedy (`--temperature 0`) measures reasoning plus terse
+formatting; endpoint-default sampling measures reasoning plus willingness to obey a
+format contract under verbosity.** Both are real capability, so nothing is dropped — read
+the two numbers apart (`passed` vs `content`), and use `--repeat N` when you want
+adherence as a rate instead of a single coin flip.
 
 ## Run modes
 
@@ -309,8 +346,30 @@ streaming parser (no model, no network).
   an alias the list does not show).
 - `--retries N` (default 1) — re-attempt a task that **errors** (transport/
   crash), not one that merely fails its verifier (a fail is a real verdict).
-  Each task records its `attempts`; the scratch dir is wiped between attempts so
+  A deterministic client-side rejection (HTTP 4xx other than 408/425/429 —
+  context too long, unsupported parameter) is **not** retried: replaying the
+  same body only costs another round trip. Each task records its `attempts`
+  and its `retryable` flag; the scratch dir is wiped between attempts so
   a crashed run's half-written `solution.py` can't leak into a retry.
+- **Context gating** — with `--context-tokens N` declared, tasks that carry a
+  prompt footprint (`longctx` tiers, see `list`) plus the `--max-tokens`
+  reservation that cannot fit inside N are skipped up front, one logged line
+  per task spelling out its own arithmetic (`prompt est + pi scaffold est +
+  --max-tokens = need, > N declared, short by M`), and recorded the same way in
+  `run.json` as `config.context_skipped`. No engine-specific probing, no error
+  string parsing: the harness never guesses a server's window. The estimate
+  divides chars by **3.8 with a 2 % margin**, calibrated on the reference
+  deployment (served 3.79–3.82 chars/token) — tokenizers that pack this filler
+  denser (gpt-oss-20b measured **4.4–4.7**, i.e. the estimate runs 21–26 % high
+  there) can therefore be screened out while they would actually fit. The gate
+  is a pessimist on purpose: leave it at `0` to send everything, lower
+  `--max-tokens`, or declare the window you really serve.
+- **No silent verdicts** — a response with no content and no tool call is
+  scored, never passed by default: reasoning but no answer (`finish_reason=
+  length`) is a `fail` with `truncated: true` and a hint to raise
+  `--max-tokens`; a completely empty response is an `error`. Tasks whose
+  verifier reads the workspace (`file`, `run`, `code`) are still scored when
+  the agent said nothing but did the work.
 - `--concurrency N` (default 1) — run N tasks in flight (load mode). Each task
   keeps its own resource sampler, so per-task NPU/CPU samples stay attributed;
   the shared endpoint is the thing under load.
@@ -320,6 +379,38 @@ streaming parser (no model, no network).
 
 ## Notes / host facts
 
+- **Defaults (0.2.0):** `--temperature` is unset by default, so the api backend
+  omits the parameter and the endpoint's own sampling config is what gets
+  measured; the recorded pre-0.2.0 baselines in `results/` were all greedy
+  (`temperature: 0.0` in their `run.json`). Re-run with `--temperature 0` for a
+  directly comparable number, or treat the recorded `temperature` field as the
+  split. Same release: `longctx/needle-128k` was resized (512k → 448k filler
+  chars) so it fits a 128k-token window.
+- **Real-endpoint confirmation (2026-10-16, `results/local/20261016-233946_gpt-oss-20b_pi`):**
+  51/51 pass, 0 errors, every task one attempt, `temperature` omitted — served
+  prompt tokens 7 364 / 27 894 / 95 847 for the three `longctx` tiers, so the
+  resized heavy tier cost 95 847 prompt + 16 384 requested output = 112 231
+  tokens on that deployment (at that same measured density, the old 512k-char
+  prompt would have cost ≈110k prompt tokens there — and 134 227 on the Qwen3.8
+  deployment, which is where the resize was actually needed)
+- **Strict vs content (0.2.0):** measured across the recorded baselines and the two
+  endpoint-sampled local runs — all 28 ANSWER-line tasks score a *correct* answer wrong
+  when it is decorated or explained (`ANSWER: **408**`, `408 items`, `The answer is 408.`,
+  `A is the knight`); `--temperature 0` hid this because greedy reliably emits the bare
+  token. Observed for real: `reasoning/knights-knaves` in a qwen3.6-35b-a3b pi run
+  (`exp=A got='A is the knight'`). All strict tasks are **kept** — contract adherence is
+  capability, and `ifeval` measures nothing if its constraints are relaxed — and the
+  verdict is split instead: each of the 30 answer-shaped tasks (28 ANSWER-line + 2 move
+  strings) reports `content_ok` for those variants while `passed` stays strict; the 8
+  `toolcall` tasks mirror the call contract, which *is* the behaviour. Re-scoring 275
+  recorded verdicts with the new verifiers changes **zero** strict outcomes.
+  `smoke/pong` is the one intentional strict change: trailing punctuation now passes
+  (`pong.` ok, `The word is pong` still fails, and reads as delivered).
+- **Two recorded non-sampling failures, for the record:** `ifeval/first-line-number` failed
+  4 runs because the reply said "The **42nd** Street" — the word-boundary check for `42`
+  correctly rejects it, but the prompt's "contain the number 42" invites that phrasing; and
+  `agentic/file-create` / `agentic/fix-bug` failed on claude at temp 0 with "write
+  permission hasn't been granted yet" — CLI permission gating, not the model.
 - Local model: `qwen3.8` = Qwen3.8-27B-w8a8 (W8A8, 262k ctx, MTP spec-decode)
   served by vLLM 0.23.0 on `0.0.0.0:8000` inside host-networked container
   `qwen3.8` (8× Ascend 910B4 NPUs, 64 GB HBM each).
