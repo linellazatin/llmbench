@@ -2799,7 +2799,8 @@ def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int, list[dict]]:
     skipped = 0
     too_large: list[dict] = []
     if cfg.suites:
-        active = set(cfg.suites)
+        # `full` is the explicit opt-in for every suite, including longctx.
+        active = set(SUITES) if "full" in cfg.suites else set(cfg.suites)
     elif cfg.tasks:
         # an explicit task filter IS an explicit selection — the heavy-suite
         # exclusion applies only to default (unfiltered) runs
@@ -2824,9 +2825,30 @@ def selected_tasks(cfg: RunConfig) -> tuple[list[dict], int, list[dict]]:
     return out, skipped, too_large
 
 
+def _ansi(text: str, color: str) -> str:
+    """Color terminal output when stdout is interactive and color is enabled."""
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR") is not None:
+        return text
+    code = {"green": "32", "red": "31"}.get(color)
+    return f"\033[{code}m{text}\033[0m" if code else text
+
+
+def _html_status(status: str) -> str:
+    """Color a pass/fail status in rendered Markdown reports."""
+    return _html_color(status, status)
+
+
+def _html_color(text: str, status: str) -> str:
+    color = {"pass": "#16803c", "fail": "#c62828"}.get(status)
+    return f'<span style="color: {color}">{text}</span>' if color else text
+
+
 def console_line(r: dict) -> str:
     mark = {"pass": "✓", "fail": "✗", "error": "!"}.get(r["status"], "?")
-    parts = [f"{mark} {r['id']}  {r['status']:<7}"]
+    color = {"pass": "green", "fail": "red"}.get(r["status"])
+    status = _ansi(f"{r['status']:<7}", color) if color else f"{r['status']:<7}"
+    mark = _ansi(mark, color) if color else mark
+    parts = [f"{mark} {r['id']}  {status:<7}"]
     if r.get("total_s") is not None:
         parts.append(f"{r['total_s']:.2f}s")
     if r.get("ttft_s") is not None:
@@ -2900,6 +2922,7 @@ def endpoint_preflight(cfg: "RunConfig",
 
 
 def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) -> dict:
+    run_started = time.monotonic()
     prober = NPUProber(cfg.npu_container)
     log(f"[llmbench] accelerator sampler: {prober.backend or 'none'}"
         + (f" (container {prober.container})" if prober.container else ""))
@@ -3042,6 +3065,7 @@ def run_suite(cfg: RunConfig, out_dir: str, log: Callable[[str], None] = print) 
             run["tasks"].append(r)
 
     run["finished_at"] = now_iso()
+    run["elapsed_s"] = time.monotonic() - run_started
     run["totals"] = compute_totals(run["tasks"])
     return run
 
@@ -3187,7 +3211,7 @@ def run_one_task(cfg: RunConfig, t: dict, backend: Any, prober: NPUProber,
                        if vd.get("content_ok") and not vd.get("passed") else "")
         with open(os.path.join(task_dir, f"{task_key}.md"), "w") as f:
             f.write(f"# {rid}\n\n- suite: {t['suite']}\n- backend: {cfg.backend}\n"
-                    f"- status: {res['status']}{status_note}\n"
+                    f"- status: {_html_status(res['status'])}{status_note}\n"
                     f"- ttft: {r3(res['ttft_s'])}s (first reasoning: "
                     f"{r3(res.get('ttft_first_reasoning_s'))}s)  total: {res['total_s']}s\n"
                     f"- gen: {res.get('gen_tps')} tok/s  decode(content): "
@@ -3367,7 +3391,8 @@ def render_report_md(run: dict) -> str:
         pr = fnum(s["pass_rate"] * 100, 1) + "%" if s["pass_rate"] is not None else "—"
         cr = (fnum(s["content_rate"] * 100, 1) + "%"
               if s.get("content_rate") is not None else "—")
-        L.append(f"| {suite} | {s['n']} | {s['passed']} | {s['failed']} | {s['errors']} "
+        L.append(f"| {suite} | {s['n']} | {_html_color(str(s['passed']), 'pass')} | "
+                 f"{_html_color(str(s['failed']), 'fail') if s['failed'] else s['failed']} | {s['errors']} "
                  f"| {pr} | {cr} |")
     if tot.get("n_content") is not None and tot["n_content"] != tot.get("n_pass"):
         L.append(f"\n`passed` is the strict contract verdict. `content` counts tasks where the "
@@ -3427,7 +3452,7 @@ def render_report_md(run: dict) -> str:
     L.append("|---|---|---|---|---|---|---|---|")
     for r in run["tasks"]:
         ttft = r.get("ttft_s")
-        L.append(f"| {r['id']} | {r['status']} | {r.get('total_s')} "
+        L.append(f"| {r['id']} | {_html_status(r['status'])} | {r.get('total_s')} "
                  f"| {round(ttft, 3) if ttft is not None else None} "
                  f"| {r.get('gen_tps')} | {r.get('decode_tps')} | {r.get('prompt_tokens')} "
                  f"| {r.get('completion_tokens')} |")
@@ -3442,19 +3467,40 @@ def _fmt_ci(avg: Any, ci: Any) -> str:
     return f"{avg if avg is not None else '—'} ±{ci}"
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{seconds:.1f}s"
+
+
 def console_summary(run: dict, log: Callable[[str], None] = print) -> None:
     tot = run["totals"]
+    elapsed = run.get("elapsed_s")
+    if elapsed is None and run.get("started_at") and run.get("finished_at"):
+        started = datetime.fromisoformat(run["started_at"].replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(run["finished_at"].replace("Z", "+00:00"))
+        elapsed = max(0.0, (finished - started).total_seconds())
     log("\n[llmbench] === summary ===")
-    log(f"tasks: {tot['n_tasks']}  pass: {tot['n_pass']}  fail: {tot['n_fail']}  "
+    pass_label = _ansi(f"pass: {tot['n_pass']}", "green")
+    fail_label = _ansi(f"fail: {tot['n_fail']}", "red")
+    log(f"tasks: {tot['n_tasks']}  {pass_label}  {fail_label}  "
         f"error: {tot['n_error']}"
         + (f"  ·  content: {tot['n_content']}/{tot['n_tasks']}"
            if tot.get("n_content") is not None
-           and tot["n_content"] != tot["n_pass"] else ""))
+           and tot["n_content"] != tot["n_pass"] else "")
+        + (f"  ·  elapsed: {_fmt_elapsed(elapsed)}" if elapsed is not None else ""))
     for suite, s in sorted(tot["suites"].items()):
         pr = fnum(s["pass_rate"] * 100, 1) if s["pass_rate"] is not None else "—"
         extra = (f" · content {s['content']}/{s['n']}"
                  if s["content"] != s["passed"] else "")
-        log(f"  {suite:<14} {s['passed']}/{s['n']} pass ({pr}%){extra}  "
+        passed = _ansi(f"{s['passed']}/{s['n']} pass", "green")
+        failed = _ansi(f"{s['failed']} fail", "red") if s['failed'] else "0 fail"
+        log(f"  {suite:<14} {passed} ({pr}%) {failed}{extra}  "
             f"ttft avg {_fmt_ci(s['ttft_s'].get('avg'), s.get('ttft_s_ci95'))}s  "
             f"total avg {_fmt_ci(s['total_s'].get('avg'), s.get('total_s_ci95'))}s  "
             f"gen {_fmt_ci(s['gen_tps'].get('avg'), s.get('gen_tps_ci95'))} tok/s "
@@ -3511,8 +3557,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--model", default=os.environ.get("LLMBENCH_MODEL", "qwen3.8"))
     pr.add_argument("--api-key", default=os.environ.get("LLMBENCH_API_KEY", "llmbench"))
     pr.add_argument("--suites", default="",
-                    help="comma-separated suite names (default: all except "
-                         "longctx, which is opt-in)")
+                    help="comma-separated suite names or 'full' (all suites, "
+                         "including longctx; default excludes longctx)")
     pr.add_argument("--tasks", default="", help="comma-separated task ids (default: all)")
     pr.add_argument("--repeat", type=int, default=1)
     pr.add_argument("--max-tokens", type=int, default=4096)

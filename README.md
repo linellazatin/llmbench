@@ -67,7 +67,7 @@ Current task inventory (59 tasks total): `smoke` 3 · `reasoning` 8 · `spatial`
 | `--endpoint` | any `http(s)://` URL (validated; fail-fast exit 2 otherwise), e.g. `http://127.0.0.1:8000/v1` | `$LLMBENCH_ENDPOINT` or `http://127.0.0.1:8000/v1` | the API root the backend talks to |
 | `--model` | any model id the endpoint serves | `$LLMBENCH_MODEL` or `qwen3.8` | for CLI backends also the model name handed to the CLI |
 | `--api-key` | any string | `$LLMBENCH_API_KEY` or `llmbench` | vLLM ignores it, but it is still sent |
-| `--suites` | comma-separated subset of `smoke,reasoning,spatial,ifeval,coding,tools,agentic,mullang,longctx` | all except `longctx` | gated tasks on a non-admitted backend are logged as skipped, not errors |
+| `--suites` | comma-separated suite names, or `full` | all except `longctx` | `full` selects every suite, including heavy `longctx`; gated tasks on a non-admitted backend are logged as skipped, not errors |
 | `--tasks` | comma-separated task ids (see `list`), e.g. `reasoning/knights-knaves,coding/caesar` | all in the selected suites | implies the tasks' suites — this is how `longctx` is reachable |
 | `--repeat` | int ≥ 1 | `1` | aggregates with ≥ 2 samples gain 95 % CIs (`*_ci95`) |
 | `--max-tokens` | int | `4096` | **effective on `api` and `pi` only** — the other CLIs have no output-budget knob wired. Also the output reservation the `--context-tokens` gate adds to a heavy prompt |
@@ -123,6 +123,7 @@ No CLI binary needed; streams `/chat/completions` directly.
 ```bash
 python3 llmbench.py run --backend api --suites smoke      # 3 tasks — sanity
 python3 llmbench.py run --backend api                    # 51 tasks (longctx opt-in; agentic is CLI-only)
+python3 llmbench.py run --backend api --suites full      # all suites, including the 3 heavy longctx tasks
 python3 llmbench.py run --backend api --suites longctx   # + the 3 heavy needle tasks
 python3 llmbench.py run --backend api --suites longctx --context-tokens 131072  # gate to the served window
 python3 llmbench.py run --backend api --tasks reasoning/knights-knaves,coding/caesar
@@ -248,7 +249,7 @@ Per-chip aggregates (avg/min/peak/p50/p95) land in each task's `resources` block
 
 ## Suites
 
-All tasks are original and deterministic (no dataset downloads, no network needed). Select with `--suites` (comma-separated; default = all **except the opt-in `longctx` suite**, which you must name explicitly).
+All tasks are original and deterministic (no dataset downloads, no network needed). Select with `--suites` (comma-separated; default = all except `longctx`; use `--suites full` to include the heavy suite).
 
 | suite | tasks | what's scored | verifier |
 |---|---|---|---|
