@@ -456,7 +456,13 @@ _ab = L.ApiBackend("http://127.0.0.1:1/v1", "m")
 assert _ab.temperature is None
 _body = _ab.request_body([{"role": "user", "content": "x"}])
 assert "temperature" not in _body, _body
-assert _body["max_tokens"] == 4096 and _body["stream_options"]
+assert "max_tokens" not in _body and _body["stream_options"]
+assert L.ApiBackend("http://127.0.0.1:1/v1", "m", max_tokens=8192)\
+    .request_body([])["max_tokens"] == 8192
+with _tmp.TemporaryDirectory() as scratch:
+    L.PiBackend(_bcfg("pi", max_tokens=None)).build(BTASK, scratch)
+    with open(_os.path.join(scratch, ".pi-agent", "models.json")) as f:
+        assert "maxTokens" not in _json.load(f)["providers"]["llmbench"]["models"][0]
 assert _ab.request_body([{"role": "user", "content": "x"}],
                         tools=[{"type": "function"}])["tools"]
 for _tv in (0.0, 0.7):  # 0.0 must still be sent (greedy baselines)
@@ -476,7 +482,7 @@ assert all(t.get("min_context_tokens") for t in _lc.values())
 # the conservative divisor (3.8) must never understate what chars//4 claims
 for _id, _t in _lc.items():
     assert _t["min_context_tokens"] >= len(_t["prompt"]) // 4, _id
-# top tier + the default output budget fits both 128000 and 131072 windows
+# top tier + an explicit 4096-token output budget fits these windows
 _heavy = _lc["longctx/needle-128k"]["min_context_tokens"] + 4096
 assert _heavy <= 128_000, (_heavy, "128k-class models must be able to run it")
 assert len(_lc["longctx/needle-128k"]["prompt"]) < 512_000
@@ -670,6 +676,16 @@ with _tmp.TemporaryDirectory() as out_dir:
     _r5 = L.run_one_task(_scfg(), _ft, _EmptyBackend(L.TaskOutcome()),
                          L.NPUProber(None), out_dir, 0, lambda s: None)
     assert _r5["status"] == "fail" and _r5["verdict"]["detail"] == "file missing", _r5
+
+assert L.build_parser().parse_args(["run"]).max_tokens is None
+assert L.build_parser().parse_args(["run", "--max-tokens", "8192"]).max_tokens == 8192
+for _backend in ("api", "pi"):
+    _cfg = _scfg(_backend, max_tokens=None, context_tokens=125000)
+    _need = L.context_need(_cfg, L.SUITES["longctx"][-1])
+    assert _need["max_tokens"] == 0
+    assert _need["need"] == _need["prompt_est"] + _need["scaffold_est"]
+    assert not L.context_shortfall(_cfg, L.SUITES["longctx"][-1])
+    assert L.selected_tasks(_cfg)[0]
 
 print("api parser probes OK")
 print("backend characterization probes OK")
