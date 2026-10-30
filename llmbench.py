@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SCHEMA = 1
 
 # ---------------------------------------------------------------------------
@@ -1094,7 +1094,7 @@ class ApiBackend:
     name = "api"
 
     def __init__(self, endpoint: str, model: str, api_key: str = "llmbench",
-                 max_tokens: int = 4096, temperature: Optional[float] = None,
+                 max_tokens: Optional[int] = None, temperature: Optional[float] = None,
                  timeout: float = 600.0):
         self.endpoint = endpoint.rstrip("/")
         self.model = model
@@ -1110,7 +1110,6 @@ class ApiBackend:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -1121,6 +1120,8 @@ class ApiBackend:
         # "Unsupported parameter: 'temperature'") are only benchmarkable
         # when the key is absent. Pass --temperature 0 to keep greedy
         # decoding, which is what the recorded baselines used.
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
         if self.temperature is not None:
             body["temperature"] = self.temperature
         if tools:
@@ -1383,96 +1384,110 @@ class CliBackend:
             stdin=subprocess.PIPE if stdin_text is not None
             else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        set_root(proc.pid)
-        t0 = time.monotonic()
-        deadline = t0 + cfg.timeout
+        th = eth = None
+        try:
+            set_root(proc.pid)
+            t0 = time.monotonic()
+            deadline = t0 + cfg.timeout
 
-        q: "queue.Queue" = queue.Queue()
-        err_chunks: list[bytes] = []
+            q: "queue.Queue" = queue.Queue()
+            err_chunks: list[bytes] = []
 
-        def reader() -> None:
-            assert proc.stdout is not None
-            try:
-                while True:
-                    chunk = proc.stdout.read1(4096)
-                    if not chunk:
-                        break
-                    q.put(chunk)
-            finally:
-                # sentinel even on a read error — without it the drain loop
-                # would spin until the deadline on a dead pipe
-                q.put(None)
-
-        def err_drain() -> None:
-            # drain stderr concurrently: a verbose CLI writing >64 KiB to
-            # stderr would otherwise deadlock on the full pipe buffer
-            assert proc.stderr is not None
-            try:
-                while True:
-                    chunk = proc.stderr.read1(65536)
-                    if not chunk:
-                        break
-                    if len(b"".join(err_chunks)) < 8192:
-                        err_chunks.append(chunk)
-            except (OSError, ValueError):
-                pass
-
-        th = threading.Thread(target=reader, daemon=True)
-        th.start()
-        eth = threading.Thread(target=err_drain, daemon=True)
-        eth.start()
-        if stdin_text is not None:
-            # after the reader threads are up: the child consumes at startup
-            # while its stdout sits in the kernel pipe buffer
-            try:
-                assert proc.stdin is not None
-                proc.stdin.write(stdin_text.encode())
-                proc.stdin.close()
-            except OSError as e:
-                outcome.error = f"stdin feed failed: {e}"
-        buf = b""
-        closed = False
-        while not closed:
-            drained = False
-            while not drained:
+            def reader() -> None:
+                assert proc.stdout is not None
                 try:
-                    chunk = q.get(timeout=0.1)
-                except queue.Empty:
+                    while True:
+                        chunk = proc.stdout.read1(4096)
+                        if not chunk:
+                            break
+                        q.put(chunk)
+                finally:
+                    # sentinel even on a read error — without it the drain loop
+                    # would spin until the deadline on a dead pipe
+                    q.put(None)
+
+            def err_drain() -> None:
+                # drain stderr concurrently: a verbose CLI writing >64 KiB to
+                # stderr would otherwise deadlock on the full pipe buffer
+                assert proc.stderr is not None
+                try:
+                    while True:
+                        chunk = proc.stderr.read1(65536)
+                        if not chunk:
+                            break
+                        if len(b"".join(err_chunks)) < 8192:
+                            err_chunks.append(chunk)
+                except (OSError, ValueError):
+                    pass
+
+            th = threading.Thread(target=reader, daemon=True)
+            th.start()
+            eth = threading.Thread(target=err_drain, daemon=True)
+            eth.start()
+            if stdin_text is not None:
+                # after the reader threads are up: the child consumes at startup
+                # while its stdout sits in the kernel pipe buffer
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write(stdin_text.encode())
+                    proc.stdin.close()
+                except OSError as e:
+                    outcome.error = f"stdin feed failed: {e}"
+            buf = b""
+            closed = False
+            while not closed:
+                drained = False
+                while not drained:
+                    try:
+                        chunk = q.get(timeout=0.1)
+                    except queue.Empty:
+                        break
+                    drained = True
+                    if chunk is None:
+                        closed = True
+                        break
+                    if outcome.ttft_s is None and chunk.strip():
+                        outcome.ttft_s = time.monotonic() - t0
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        self.parse_line(outcome, line.decode(errors="replace").rstrip("\r"))
+                if time.monotonic() >= deadline:
+                    self._kill(proc)
+                    if not outcome.error:
+                        outcome.error = f"timeout after {cfg.timeout:.0f}s"
                     break
-                drained = True
-                if chunk is None:
-                    closed = True
-                    break
-                if outcome.ttft_s is None and chunk.strip():
-                    outcome.ttft_s = time.monotonic() - t0
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    self.parse_line(outcome, line.decode(errors="replace").rstrip("\r"))
-            if time.monotonic() >= deadline:
+            if buf.strip():
+                # a final event without a trailing newline must not be dropped
+                self.parse_line(outcome, buf.decode(errors="replace").rstrip("\r"))
+            th.join(timeout=5)
+            eth.join(timeout=5)
+            outcome.exit_code = proc.poll()
+            if outcome.exit_code is None:  # not yet reaped (rare after pipe EOF)
+                try:
+                    outcome.exit_code = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._kill(proc)
+                    outcome.exit_code = proc.wait()
+            outcome.stderr_tail = b"".join(err_chunks)[-1200:].decode(errors="replace")
+            outcome.total_s = time.monotonic() - t0
+            if outcome.ttft_model_s is not None:  # parse_line stored a monotonic clock value
+                outcome.ttft_model_s = round(outcome.ttft_model_s - t0, 3)
+            self.finalize(outcome)
+            self.after_run(scratch)
+            return outcome
+        finally:
+            # CLI children have their own session, so Ctrl-C in the parent
+            # does not stop them. Always reap them and close their streams.
+            if proc.poll() is None:
                 self._kill(proc)
-                if not outcome.error:
-                    outcome.error = f"timeout after {cfg.timeout:.0f}s"
-                break
-        if buf.strip():
-            # a final event without a trailing newline must not be dropped
-            self.parse_line(outcome, buf.decode(errors="replace").rstrip("\r"))
-        th.join(timeout=5)
-        eth.join(timeout=5)
-        outcome.exit_code = proc.poll()
-        if outcome.exit_code is None:  # not yet reaped (rare after pipe EOF)
-            try:
-                outcome.exit_code = proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._kill(proc)
-                outcome.exit_code = proc.wait()
-        outcome.stderr_tail = b"".join(err_chunks)[-1200:].decode(errors="replace")
-        outcome.total_s = time.monotonic() - t0
-        if outcome.ttft_model_s is not None:  # parse_line stored a monotonic clock value
-            outcome.ttft_model_s = round(outcome.ttft_model_s - t0, 3)
-        self.finalize(outcome)
-        self.after_run(scratch)
-        return outcome
+            proc.wait()
+            for thread in (th, eth):
+                if thread is not None and thread.ident is not None:
+                    thread.join(timeout=5)
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
 
     def after_run(self, scratch: str) -> None:  # noqa: B027
         pass
@@ -1787,8 +1802,8 @@ class PiBackend(CliBackend):
         agent_dir = os.path.join(scratch, ".pi-agent")
         os.makedirs(agent_dir, exist_ok=True)
         # self-contained: pi reads ONLY this file, so no user-model bleed.
-        # maxTokens mirrors --max-tokens so the output budget matches the api
-        # backend (parity); when --pi-thinking is set, declare reasoning + the
+        # maxTokens mirrors an explicit --max-tokens; otherwise pi uses its
+        # own default. When --pi-thinking is set, declare reasoning + the
         # qwen-chat-template compat so pi maps the level to the Qwen wire
         # switch (chat_template_kwargs {enable_thinking: level != "off",
         # preserve_thinking: true}); default (unset) keeps the wire exactly
@@ -1797,8 +1812,9 @@ class PiBackend(CliBackend):
                        # honor a declared window so pi compacts like the
                        # endpoint actually allows; 262144 is the historical
                        # assumption for the reference deployment
-                       "contextWindow": cfg.context_tokens or 262144,
-                       "maxTokens": cfg.max_tokens}
+                       "contextWindow": cfg.context_tokens or 262144}
+        if cfg.max_tokens is not None:
+            model_entry["maxTokens"] = cfg.max_tokens
         if cfg.pi_thinking:
             model_entry["reasoning"] = True
             model_entry["compat"] = {"thinkingFormat": "qwen-chat-template"}
@@ -2695,8 +2711,8 @@ LONGCTX_TASKS: list[dict] = [
                       "they appear, separated by commas (e.g. 'AB12, CD34, "
                       "EF56').",
              expected="A1B2, C3D4, E5F6"),
-    # 128k-token-window tier: ~120k prompt tokens + the default 4096-token
-    # output budget = ~124k, so it runs on 128000- and 131072-token models.
+    # 128k-token-window tier: ~120k prompt tokens leaves room for output
+    # in 128000- and 131072-token windows; no output cap is imposed by default.
     # (512k chars ≈ 134k prompt tokens on the served tokenizer — that overshot
     # every 128k window and could only ever return a context-length error.)
     _longctx("longctx/needle-128k", seed=303, n_chars=448_000,
@@ -2741,7 +2757,7 @@ class RunConfig:
     suites: list[str]
     tasks: list[str]
     repeat: int
-    max_tokens: int
+    max_tokens: Optional[int]  # None = no harness output-budget override
     temperature: Optional[float]  # None = omit the parameter (endpoint default)
     timeout: float
     sample_interval: float
@@ -2783,8 +2799,9 @@ def context_need(cfg: RunConfig, t: dict) -> dict:
         return {}
     prompt_est = t["min_context_tokens"]
     scaffold = _PI_SCAFFOLD_TOKENS if cfg.backend == "pi" else 0
-    need = prompt_est + cfg.max_tokens + scaffold
-    return {"prompt_est": prompt_est, "max_tokens": cfg.max_tokens,
+    output_reservation = cfg.max_tokens if cfg.max_tokens is not None else 0
+    need = prompt_est + output_reservation + scaffold
+    return {"prompt_est": prompt_est, "max_tokens": output_reservation,
             "scaffold_est": scaffold, "need": need,
             "declared_context": cfg.context_tokens,
             "shortfall": max(0, need - cfg.context_tokens)}
@@ -3561,7 +3578,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "including longctx; default excludes longctx)")
     pr.add_argument("--tasks", default="", help="comma-separated task ids (default: all)")
     pr.add_argument("--repeat", type=int, default=1)
-    pr.add_argument("--max-tokens", type=int, default=4096)
+    pr.add_argument("--max-tokens", type=int, default=None,
+                    help="output-token budget override (default: backend/server default)")
     pr.add_argument("--temperature", type=float, default=None,
                     help="sampling temperature for the api backend; when the "
                          "flag is omitted the parameter is not sent at all, so "
@@ -3623,8 +3641,8 @@ def cmd_list(_: argparse.Namespace) -> None:
             # heavy tasks publish their prompt footprint so a caller can gate
             # them with --context-tokens (prompt + --max-tokens must fit)
             need = t.get("min_context_tokens")
-            ctx = (f"prompt ~{need:,}, needs ≥{need + 4096:,} with the default "
-                   f"--max-tokens 4096" if need else "—")
+            ctx = (f"prompt ~{need:,}, plus output budget and backend scaffolding"
+                   if need else "—")
             print(f"  {t['id']:<28} {t['verify']['type']:<12} {bks:<26} {ctx}")
 
 
