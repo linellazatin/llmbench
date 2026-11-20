@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 SCHEMA = 1
 
 # ---------------------------------------------------------------------------
@@ -1925,6 +1925,120 @@ class PiBackend(CliBackend):
                 outcome.error = "no assistant message received"
 
 
+class OpenCodeBackend(CliBackend):
+    """opencode run --format json — JSONL session events with tool calls.
+
+    Passes a provider overlay through OPENCODE_CONFIG_CONTENT and selects
+    it explicitly. Standalone mode avoids using a pre-existing server.
+    """
+
+    name = "opencode"
+
+    def build(self, t: dict, scratch: str) -> tuple[list[str], dict]:
+        cfg = self.cfg
+        self._prompt = self.full_prompt(t)  # only used for token estimation
+        # Supply an ephemeral config overlay without modifying OpenCode files.
+        config = {
+            "$schema": "https://opencode.ai/config.json",
+            "model": f"llmbench/{cfg.model}",
+            "providers": {
+                "llmbench": {
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "name": "llmbench",
+                    "settings": {
+                        "baseURL": cfg.endpoint,
+                        "apiKey": "{env:LLMBENCH_OPENCODE_API_KEY}",
+                    },
+                    "models": {
+                        cfg.model: {
+                            "name": cfg.model,
+                            "limit": {
+                                "context": cfg.context_tokens or 131072,
+                                "output": min(8192, (cfg.context_tokens or 131072) // 4),
+                            },
+                        }
+                    },
+                }
+            },
+        }
+
+        cmd = [
+            "opencode", "run", "--standalone", "--format", "json", "--auto", "--archived",
+            "--model", f"llmbench/{cfg.model}",
+        ]
+        via_stdin = self.stdin_for(t) is not None
+        if t.get("system") and not via_stdin:
+            # opencode has no --append-system-prompt; prepend to prompt
+            cmd += [f"{t['system']}\n\n{t['prompt']}"]
+        elif not via_stdin:
+            cmd += [t["prompt"]]
+
+        env = dict(os.environ)
+        env["XDG_CONFIG_HOME"] = scratch
+        env["OPENCODE_CONFIG_PROJECT_DISABLE"] = "true"
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+        env["LLMBENCH_OPENCODE_API_KEY"] = cfg.api_key
+        return cmd, env
+
+    def stdin_for(self, t: dict) -> "str | None":
+        prompt = self.full_prompt(t)
+        return prompt if len(prompt) > 96_000 else None
+
+    def parse_line(self, outcome: TaskOutcome, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("{"):
+            # opencode's bash wrapper prints "Loading env: ..." to stdout;
+            # skip it so it doesn't contaminate the model response text.
+            return
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        et = ev.get("type")
+        if et == "error":
+            outcome.error = f"opencode error: {ev.get('error', ev)}"
+        elif et == "text":
+            text = (ev.get("part") or {}).get("text", "")
+            if text:
+                outcome.text += text
+                outcome.finish_reason = "stop"
+            if outcome.ttft_model_s is None:
+                outcome.ttft_model_s = time.monotonic()
+        elif et == "tool_use":
+            part = ev.get("part") or {}
+            tool_name = part.get("tool", "?")
+            state = part.get("state") or {}
+            outcome.events.append({
+                "event": "tool_use",
+                "tool": tool_name,
+                "status": state.get("status"),
+            })
+        elif et == "step_finish":
+            part = ev.get("part") or {}
+            toks = part.get("tokens") or {}
+            cache = toks.get("cache") or {}
+            # Accumulate tokens across steps
+            outcome.prompt_tokens = (outcome.prompt_tokens or 0) \
+                + toks.get("input", 0) \
+                + cache.get("read", 0) \
+                + cache.get("write", 0)
+            outcome.completion_tokens = (outcome.completion_tokens or 0) \
+                + toks.get("output", 0)
+            outcome.token_source = "server"
+            reason = part.get("reason", "")
+            if reason:
+                outcome.finish_reason = reason
+
+    def finalize(self, outcome: TaskOutcome) -> None:
+        outcome.text = outcome.text.strip()
+        super().finalize(outcome)
+        if not outcome.error and outcome.exit_code not in (0, None):
+            outcome.error = (f"opencode exit {outcome.exit_code}: "
+                             f"{outcome.stderr_tail[-300:]}")
+        elif not outcome.text and not outcome.error:
+            outcome.error = "no text response received"
+
+
 @dataclass(frozen=True)
 class BackendSpec:
     """One BACKEND_REGISTRY row: how to construct the backend plus the
@@ -1946,6 +2060,7 @@ BACKEND_REGISTRY: dict[str, BackendSpec] = {
         ("--codex-provider", os.environ.get("LLMBENCH_CODEX_PROVIDER", "vllm"),
          "codex model_providers entry name (default: vllm)"),)),
     "claude": BackendSpec(factory=lambda cfg: ClaudeBackend(cfg)),
+    "opencode": BackendSpec(factory=lambda cfg: OpenCodeBackend(cfg)),
     "pi": BackendSpec(factory=lambda cfg: PiBackend(cfg), flags=(
         ("--pi-tools", "",
          "pin pi's toolset to this comma-separated allowlist "
@@ -2518,7 +2633,7 @@ TOOLS_TASKS: list[dict] = [
 
 # --- agentic (CLI backends: real shell + file access) -----------------------
 
-CLI_BACKENDS = ["dsh", "codex", "claude", "pi"]
+CLI_BACKENDS = ["dsh", "codex", "claude", "opencode", "pi"]
 
 BUGGY_PY = '''def double_total(nums):
     total = 0
