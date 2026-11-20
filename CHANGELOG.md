@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **`opencode` backend** - drives OpenCode v2 with an in-memory provider overlay and explicit model selection.
+  - Supports agentic suites (code, file ops, shell commands), server-side token usage from step events, and large prompts via stdin.
+  - The overlay configures an OpenAI-compatible provider without writing a config file. OpenCode may still load other configuration.
+
 ## 0.2.1
 
 ### Changed

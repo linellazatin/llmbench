@@ -18,6 +18,7 @@ python3 llmbench.py run --backend api --endpoint http://127.0.0.1:8000/v1 --mode
 # (same endpoint/model, from flags or the LLMBENCH_* env vars)
 python3 llmbench.py run --backend codex --suites agentic
 python3 llmbench.py run --backend dsh --suites reasoning,spatial
+python3 llmbench.py run --backend opencode --suites reasoning,coding
 python3 llmbench.py run --backend pi --suites reasoning,coding
 
 # browse tasks, re-render a report, compare runs, or monitor resources standalone
@@ -46,8 +47,9 @@ Each `run` writes to `results/<timestamp>_<model>_<backend>/`:
 | `codex` | ✅ | `codex exec --json` with `-c` provider overrides pointing at the local endpoint; JSONL events, per-turn `usage` (server-side tokens) |
 | `claude` | ✅ | `claude -p --output-format stream-json --verbose` → `ANTHROPIC_BASE_URL` = endpoint minus `/v1`. **No bridge needed: vLLM ≥ 0.23 serves the Anthropic `/v1/messages` protocol natively** (verified non-streaming + streaming SSE incl. `thinking` blocks). Server-side tokens from the `result` event |
 | `pi` | ✅ | `pi --mode json --no-session --provider llmbench --model <m> --api-key <k>`; the per-run agent dir under the task scratch (`PI_CODING_AGENT_DIR`) holds a self-contained `models.json` provider (`baseUrl` from `--endpoint`, model, key) — `~/.pi/agent` is never touched, and a bare scratch dir triggers no trust prompt. **No trust/permission plumbing needed** (unlike claude): pi runs tools without per-call approval in one-shot mode. Server-side tokens from per-response `usage` events. `--pi-tools <list>` pins pi's toolset (isolation parity with the claude allowlist; default = pi's full toolset). `--pi-thinking <level>` sets pi's thinking level (parity knob; default = model default; on qwen-style vLLM models the level maps to `enable_thinking`: off disables, other levels force on), and thinking text is captured into the task `.md` Reasoning section (artifact parity with the api backend) |
+| `opencode` | ✅ | `opencode run --standalone --format json --auto --archived -m llmbench/<model>` with an in-memory provider configuration. Requires a compatible OpenCode v2 installation and an OpenAI-compatible endpoint. |
 
-CLI backends run the model as a **full agent**: they get a working directory (the per-task scratch dir) plus shell/file tools, which is what the `agentic` suite exercises. All five backends are validated live against `qwen3.8` (see *Host facts* below).
+CLI backends run the model as a **full agent**: they get a working directory (the per-task scratch dir) plus shell/file tools, which is what the `agentic` suite exercises. The OpenCode backend requires independent live validation against the target endpoint.
 
 Claude-specific plumbing (non-interactive agentic as root):
 
@@ -63,7 +65,7 @@ Current task inventory (59 tasks total): `smoke` 3 · `reasoning` 8 · `spatial`
 
 | flag | values | default | notes |
 |---|---|---|---|
-| `--backend` | `api` \| `dsh` \| `codex` \| `claude` \| `pi` | `api` | |
+| `--backend` | `api` \| `dsh` \| `codex` \| `claude` \| `opencode` \| `pi` | `api` | |
 | `--endpoint` | any `http(s)://` URL (validated; fail-fast exit 2 otherwise), e.g. `http://127.0.0.1:8000/v1` | `$LLMBENCH_ENDPOINT` or `http://127.0.0.1:8000/v1` | the API root the backend talks to |
 | `--model` | any model id the endpoint serves | `$LLMBENCH_MODEL` or `qwen3.8` | for CLI backends also the model name handed to the CLI |
 | `--api-key` | any string | `$LLMBENCH_API_KEY` or `llmbench` | vLLM ignores it, but it is still sent |
@@ -222,17 +224,37 @@ python3 llmbench.py run --backend pi --pi-thinking off --suites smoke
 | shared flags effective | `--max-tokens` ✓ when explicit (→ `maxTokens` in the generated `models.json`; otherwise pi's default applies), `--temperature` ✗, `--context-tokens` ✓ (selection gate, incl. pi's own scaffolding, and declared as pi's `contextWindow`) |
 | tokens / latency | server `usage` summed over the task's responses; `ttft_model_s` = first assistant event; fastest CLI observed, lowest prompt-token cost |
 
+### opencode
+
+Requires OpenCode v2 on PATH. Use an OpenAI-compatible `/v1` endpoint, for example `http://localhost:7679/v1` for llama-server or `http://localhost:4000/v1` for LiteLLM, with the model ID and any required key supplied via `--model` and `--api-key`. Direct native Anthropic access is not implemented; use a compatible proxy route. Existing result directories from earlier versions may contain plaintext keys.
+
+```bash
+python3 llmbench.py run --backend opencode --suites smoke
+python3 llmbench.py run --backend opencode                     # 48 tasks; tools+longctx auto-skipped
+python3 llmbench.py run --backend opencode --suites agentic    # file ops, shell, fixing a failing unit test
+```
+
+| item | value |
+|---|---|
+| invocation | `opencode run --standalone --format json --auto --archived --model llmbench/<model> <prompt>`; large prompts are piped via stdin and system prompts are prepended |
+| per-run overlay | `OPENCODE_CONFIG_CONTENT` defines the provider and references the key via an environment variable. llmbench does not write an OpenCode config file. A per-task `XDG_CONFIG_HOME` avoids user-global policies; managed configuration and wrapper scripts may still affect execution. |
+| env set | `OPENCODE_CONFIG_CONTENT`, `LLMBENCH_OPENCODE_API_KEY`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG_PROJECT_DISABLE` |
+| backend-specific flags | — (none) |
+| suites | 7 (same as dsh/codex/claude) = 48 tasks |
+| shared flags effective | `--max-tokens` ✗, `--temperature` ✗, `--context-tokens` ✓ (selection gate only; declared as the model's `limit.context` in the generated config) |
+| tokens / latency | server `usage` from accumulated `step_finish` events (`input + cache.read + cache.write` for prompt, `output` for completion); `ttft_model_s` = first `text` event; JSONL stream — tool-use events surface in the task `.md` `CLI events` section |
+
 After any run: artifacts land in the run dir (see the table in Quick start), `report` re-renders, `compare` puts two runs side by side. And the standing rule: backends sharing one endpoint run **sequentially** — never in parallel.
 
 ## Metrics (see `metrics_legend` in run.json)
 
 - `ttft_s` — `api`: request sent → first **content** token. `cli`: spawn → first stdout byte (includes CLI startup)
-- `ttft_model_s` — request/spawn → first **model-originated** output (codex: first item event; claude: first assistant event; pi: first assistant event; dsh: final message, it buffers). Use this for cross-backend *model* latency — `ttft_s` on a CLI is mostly process startup
+- `ttft_model_s` — request/spawn → first **model-originated** output (codex: first item event; claude: first assistant event; pi: first assistant event; opencode: first `text` event; dsh: final message, it buffers). Use this for cross-backend *model* latency — `ttft_s` on a CLI is mostly process startup
 - `ttft_first_reasoning_s` — `api`: request sent → first **reasoning** token (both `reasoning` and `reasoning_content` delta fields count; reasoning models stream thinking before content). CLI backends: degenerate (= `ttft_s`)
 - `gen_tps` — completion tokens / (end − `ttft_model_s`). For `api` this is the server decode rate (incl. reasoning); on CLI backends it also spans tool round-trips; suppressed when the window < 1 s (buffered CLIs)
 - `decode_tps` — content chunks / (end − ttft) → content-only rate, `api` only (suppressed for windows < 250 ms)
 - `overall_tps` — completion tokens / total latency (incl. TTFT)
-- tokens — from server `usage` when the backend reports it (`token_source=server`: codex/claude/pi — cumulative over the task's internal API calls **including the harness system prompt**; api — the stream's usage chunk). Otherwise ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`, and `api` against engines with no streamed usage). `completion_tokens` **includes reasoning tokens**
+- tokens — from server `usage` when the backend reports it (`token_source=server`: codex/claude/pi/opencode — cumulative over the task's internal API calls **including the harness system prompt**; api — the stream's usage chunk). Otherwise ~4 chars/token of the task prompt only (`token_source=estimate`, e.g. `dsh`, and `api` against engines with no streamed usage). `completion_tokens` **includes reasoning tokens**
 - **`passed` vs `content_ok`** — two readings of every scored task. `passed` is the strict contract verdict (the answer line must *be* the value). `content_ok` answers a different question: was the value delivered at all, ignoring markdown, quotes, a unit or a prose lead-in — `ANSWER: **408**`, `ANSWER: 408 items`, `ANSWER: A is the knight` all deliver. Only answer-shaped verifiers (`exact`, `answer`, `math`, `gridpath`, a tool task's `answer`) split the two; constraint, unittest, file and post-run verdicts mirror `passed` because their form *is* the content. Aggregates: `totals.n_content` and `suites.<s>.content/content_rate`; the console summary and `report.md` show `content` only where it exceeds the strict pass count (the `report.md` scorecard always shows the column, so older runs render `—`), `compare` gets a `value delivered` row, and a task `.md` says `(value delivered, answer line not exact)`. Strict scoring is unchanged, so pre-0.2.0 baselines stay comparable. `content_ok` is a formatting signal, never a correctness claim — `ANSWER: A is the knave` reads as delivered
 
 The `api` backend is the reference for pure server metrics; CLI numbers include harness overhead. **Run backends sequentially when they share one endpoint** (e.g. this host's single vLLM) — parallel runs contend on the NPU and corrupt each other's latency/throughput.
